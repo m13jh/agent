@@ -28,10 +28,26 @@ python-agent run "读取 README.md" --demo-read README.md
 
 ## 使用 DeepSeek
 
-DeepSeek 使用 OpenAI-compatible API。设置 `DEEPSEEK_API_KEY` 后运行：
+在 `python-agent` 项目根目录创建 `.env`（可以复制 `.env.example`），配置连接参数：
+
+```dotenv
+DEEPSEEK_API_KEY=sk-your-key-here
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_TIMEOUT_SECONDS=120
+DEEPSEEK_MODEL=deepseek-chat
+```
+
+代码会优先读取构造函数显式参数，其次读取已经存在的环境变量，最后读取项目 `.env`。
+`.env` 默认不会覆盖已经由 Shell 或 Conda 设置的同名环境变量。建议保护密钥文件：
 
 ```bash
-python-agent run "检查项目结构" --provider deepseek --model deepseek-chat
+chmod 600 .env
+```
+
+配置完成后运行：
+
+```bash
+python-agent run "检查项目结构" --provider deepseek
 ```
 
 也可以直接使用 Python API：
@@ -66,3 +82,6 @@ pytest
 
 当前仅实现阶段 1 的单次 `run(prompt)` API；durable inbox、steer/inject、JSONL 恢复和子
 Agent 属于后续阶段。
+
+CLI 会实时显示模型文本增量、工具调用和工具结果。DeepSeek 使用 SSE 流式接口；Fake
+Adapter 也会切分文本，用于离线验证同样的显示流程。

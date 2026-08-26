@@ -46,6 +46,22 @@ class AssistantResponse(BaseModel):
     usage: Usage = Field(default_factory=Usage)
 
 
+class ModelChunk(BaseModel):
+    """一次流式模型响应中的增量片段。
+
+    文本内容会在到达时立即交给 CLI；工具调用通常会被 Provider 拆成多个片段，
+    因此适配器负责在流结束前把它们重新拼成完整的 ToolCall，再交给 Agent Loop。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: str | None = None
+    tool_calls: list[ToolCall] = Field(default_factory=list)
+    finish_reason: Literal["stop", "tool_calls", "length", "error"] | None = None
+    usage: Usage | None = None
+    done: bool = False
+
+
 def tool_call_data(call: ToolCall) -> dict[str, Any]:
     """把标准化 ToolCall 转换成可直接写入事件日志的字典。"""
 

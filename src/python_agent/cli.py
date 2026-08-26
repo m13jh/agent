@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -18,6 +20,36 @@ from python_agent.llm.fake_adapter import FakeAdapter, ResponseFactory
 from python_agent.llm.types import AssistantResponse, ModelRequest, ToolCall
 from python_agent.tools.builtins import EchoTool, ListFilesTool, ReadFileTool, SearchTextTool
 from python_agent.tools.registry import ToolRegistry
+
+
+def _display_event(event_type: str, data: dict[str, Any]) -> None:
+    """把 Agent 的实时通知渲染成终端输出。
+
+    ``assistant/delta`` 直接以无换行方式打印，所以用户能看到模型逐段生成；工具事件
+    则主动换行并显示工具名和参数，避免工具信息和模型半截句子粘在同一行。工具结果
+    只展示有限长度，完整结果仍然保存在 Session 的 ``tool/result`` 事件中。
+    """
+
+    if event_type == "assistant/delta":
+        content = data.get("content")
+        if isinstance(content, str):
+            print(content, end="", flush=True)
+        return
+    if event_type == "assistant/message":
+        # 流式响应已经逐段输出过，不能在这里把完整回答再打印一次。
+        if data.get("streamed") is not True and isinstance(data.get("content"), str):
+            print(data["content"], end="", flush=True)
+        return
+    if event_type == "tool/call":
+        arguments = json.dumps(data.get("arguments", {}), ensure_ascii=False, sort_keys=True)
+        print(f"\n\n[工具调用] {data.get('name')}\n参数：{arguments}", flush=True)
+        return
+    if event_type == "tool/result":
+        content = data.get("content")
+        rendered = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+        if len(rendered) > 2000:
+            rendered = rendered[:2000] + "\n[终端显示已截断，Session 中保留完整结果]"
+        print(f"[工具结果] {data.get('name')}：\n{rendered}", flush=True)
 
 
 def _demo_responder(path: str) -> ResponseFactory:
@@ -68,7 +100,7 @@ async def _run(args: argparse.Namespace) -> int:
     registry = ToolRegistry([ReadFileTool(), ListFilesTool(), SearchTextTool(), EchoTool()])
     if args.provider == "deepseek":
         adapter: ModelAdapter = DeepSeekAdapter()
-        model = args.model or "deepseek-chat"
+        model = args.model or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
     else:
         adapter = FakeAdapter(_demo_responder(args.demo_read) if args.demo_read else None)
         model = args.model or "fake-model"
@@ -78,8 +110,14 @@ async def _run(args: argparse.Namespace) -> int:
         max_steps=args.max_steps,
         workspace=args.workspace.resolve(),
     )
-    result = await AgentLoop(adapter, registry, config=config).run(args.prompt)
-    print(result.answer)
+    result = await AgentLoop(
+        adapter,
+        registry,
+        config=config,
+        event_handler=_display_event,
+    ).run(args.prompt)
+    # 流式内容在事件回调中已经输出，这里只补一个换行，避免 Shell 提示符紧贴答案。
+    print()
     if args.show_events:
         print("\n--- session events ---")
         for event in result.session.events:

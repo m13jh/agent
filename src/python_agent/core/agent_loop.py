@@ -3,18 +3,29 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Literal
 
 from python_agent.config import AgentPreset
 from python_agent.ids import new_message_id
 from python_agent.llm.adapter import ModelAdapter, ModelRouter
-from python_agent.llm.types import ModelRequest, tool_call_data
+from python_agent.llm.types import (
+    AssistantResponse,
+    ModelChunk,
+    ModelRequest,
+    ToolCall,
+    Usage,
+    tool_call_data,
+)
 from python_agent.prompt.assembler import PromptAssembler
 from python_agent.session.session import Session
 from python_agent.tools.registry import ToolRegistry
 from python_agent.tools.runtime import ToolRuntime
 from python_agent.tools.types import ToolContext
+
+EventHandler = Callable[[str, dict[str, Any]], None]
 
 
 @dataclass(slots=True)
@@ -45,6 +56,7 @@ class AgentLoop:
         session: Session | None = None,
         system_prompt: str | None = None,
         workspace: Path | None = None,
+        event_handler: EventHandler | None = None,
     ) -> None:
         self.config = config or AgentPreset()
         self.adapter = adapter
@@ -57,6 +69,7 @@ class AgentLoop:
         self.system_prompt = system_prompt or self.prompt_assembler.assemble()
         self.cancel_event = asyncio.Event()
         self._runtime = ToolRuntime(self.tools, max_result_chars=self.config.max_tool_result_chars)
+        self.event_handler = event_handler
 
     def cancel(self) -> None:
         """请求协作式取消当前正在进行的模型或工具操作。
@@ -104,6 +117,62 @@ class AgentLoop:
             temperature=self.config.temperature,
         )
 
+    def _emit(self, event_type: str, data: dict[str, Any]) -> None:
+        """把实时观察事件交给 CLI 或上层 UI，不改变 Session 的权威事实。"""
+
+        if self.event_handler is not None:
+            self.event_handler(event_type, data)
+
+    async def _complete_response(
+        self,
+        adapter: ModelAdapter,
+        request: ModelRequest,
+        *,
+        turn: int,
+        step: int,
+    ) -> tuple[AssistantResponse, bool]:
+        """统一处理流式和非流式 Adapter，并返回完整的标准化响应。
+
+        流式模式只负责把文本片段实时通知出去；Session 仍然在整个响应完成后记录一个
+        完整的 ``assistant/message``。这样用户有即时反馈，同时事件日志不会保存半截的
+        assistant 消息或半截的工具参数。
+        """
+
+        stream = getattr(adapter, "stream", None)
+        if not callable(stream):
+            response = await adapter.complete(request, cancel_event=self.cancel_event)
+            return response, False
+
+        content_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        finish_reason: Literal["stop", "tool_calls", "length", "error"] = "stop"
+        usage = Usage()
+        async for raw_chunk in stream(request, cancel_event=self.cancel_event):
+            chunk = (
+                raw_chunk
+                if isinstance(raw_chunk, ModelChunk)
+                else ModelChunk.model_validate(raw_chunk)
+            )
+            if chunk.content:
+                content_parts.append(chunk.content)
+                self._emit(
+                    "assistant/delta",
+                    {"turn": turn, "step": step, "content": chunk.content},
+                )
+            if chunk.tool_calls:
+                tool_calls = chunk.tool_calls
+            if chunk.finish_reason is not None:
+                finish_reason = chunk.finish_reason
+            if chunk.usage is not None:
+                usage = chunk.usage
+        response = AssistantResponse(
+            content="".join(content_parts) or None,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            usage=usage,
+        )
+        return response, True
+
     async def run(self, prompt: str) -> RunResult:
         """运行用户 prompt，直到模型给出最终回答或达到配置的步骤上限。
 
@@ -122,19 +191,23 @@ class AgentLoop:
         prompt_pending = True
 
         try:
+            # 1. 通过经典 for 循环限制最大步骤数，防止模型和工具陷入死循环。
             for _ in range(self.config.max_steps):
+                # 2. 每次发起新的 Step 前检查协作式取消信号。
                 if self.cancel_event.is_set():
                     raise asyncio.CancelledError
                 step = self.session.next_step()
                 self.session.append("step/start", {"turn": turn, "step": step})
                 step_closed = False
                 try:
+                    # 3. 第一次循环时把用户 prompt 写入 Session；后续循环只追加工具结果。
                     if prompt_pending:
                         self.session.append(
                             "user/message",
                             {"message_id": str(new_message_id()), "content": prompt},
                         )
                         prompt_pending = False
+                    # 4. 从 Session 事件投影消息，并组装本次请求和工具 Schema。
                     request = self._request()
                     self.session.append(
                         "request/header",
@@ -147,17 +220,23 @@ class AgentLoop:
                             "tools": request.tools,
                         },
                     )
-                    response = await adapter.complete(request, cancel_event=self.cancel_event)
-                    last_answer = response.content or ""
-                    self.session.append(
-                        "assistant/message",
-                        {
-                            "content": response.content,
-                            "tool_calls": [tool_call_data(call) for call in response.tool_calls],
-                            "finish_reason": response.finish_reason,
-                            "usage": response.usage.model_dump(),
-                        },
+                    # 5. 发起模型请求：优先使用流式 stream()，否则回退到 complete()。
+                    response, streamed = await self._complete_response(
+                        adapter,
+                        request,
+                        turn=turn,
+                        step=step,
                     )
+                    last_answer = response.content or ""
+                    assistant_event_data = {
+                        "content": response.content,
+                        "tool_calls": [tool_call_data(call) for call in response.tool_calls],
+                        "finish_reason": response.finish_reason,
+                        "usage": response.usage.model_dump(),
+                        "streamed": streamed,
+                    }
+                    self.session.append("assistant/message", assistant_event_data)
+                    self._emit("assistant/message", assistant_event_data)
 
                     if not response.tool_calls:
                         reason = "max_tokens" if response.finish_reason == "length" else "completed"
@@ -169,17 +248,20 @@ class AgentLoop:
                         self.session.append("turn/end", {"turn": turn, "reason": reason})
                         return RunResult(last_answer, self.session, response.finish_reason)
 
+                    # 6. 模型要求工具时，先记录并通知调用方，再交给 ToolRuntime 串行执行。
                     for call in response.tool_calls:
+                        tool_call_event_data = {
+                            "turn": turn,
+                            "step": step,
+                            "call_id": str(call.id),
+                            "name": call.name,
+                            "arguments": call.arguments,
+                        }
                         self.session.append(
                             "tool/call",
-                            {
-                                "turn": turn,
-                                "step": step,
-                                "call_id": str(call.id),
-                                "name": call.name,
-                                "arguments": call.arguments,
-                            },
+                            tool_call_event_data,
                         )
+                        self._emit("tool/call", tool_call_event_data)
                         result = await self._runtime.execute(
                             call,
                             ToolContext(
@@ -188,7 +270,9 @@ class AgentLoop:
                                 cancel_event=self.cancel_event,
                             ),
                         )
-                        self.session.append("tool/result", result.event_data())
+                        tool_result_event_data = result.event_data()
+                        self.session.append("tool/result", tool_result_event_data)
+                        self._emit("tool/result", tool_result_event_data)
                         if result.concludes_turn:
                             self.session.append(
                                 "step/end",

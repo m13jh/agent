@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from typing import Protocol, runtime_checkable
 
 from python_agent.errors import ModelError
-from python_agent.llm.types import AssistantResponse, ModelRequest
+from python_agent.llm.types import AssistantResponse, ModelChunk, ModelRequest
 
 
 @runtime_checkable
@@ -20,6 +20,18 @@ class ModelAdapter(Protocol):
         *,
         cancel_event: asyncio.Event,
     ) -> AssistantResponse: ...
+
+
+@runtime_checkable
+class StreamingModelAdapter(Protocol):
+    """可选的流式模型适配器协议，不强制旧的 complete-only 适配器实现。"""
+
+    async def stream(
+        self,
+        request: ModelRequest,
+        *,
+        cancel_event: asyncio.Event,
+    ) -> AsyncIterator[ModelChunk]: ...
 
 
 class ModelRouter:

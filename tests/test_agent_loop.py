@@ -76,3 +76,34 @@ async def test_tool_error_is_visible_to_next_model_step() -> None:
 
     assert result.answer == "I recovered from the tool error"
     assert adapter.requests[1].messages[-1]["content"].startswith("ToolValidationError:")
+
+
+async def test_streaming_adapter_emits_deltas_and_tool_events() -> None:
+    adapter = FakeAdapter(
+        [
+            {
+                "content": "先查看目录。",
+                "tool_calls": [{"id": "list-1", "name": "echo", "arguments": {"value": "ok"}}],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "目录检查完成。", "finish_reason": "stop"},
+        ]
+    )
+    live_events: list[tuple[str, dict]] = []
+
+    def collect(event_type: str, data: dict) -> None:
+        live_events.append((event_type, data))
+
+    result = await AgentLoop(
+        adapter,
+        ToolRegistry([EchoTool()]),
+        event_handler=collect,
+    ).run("检查")
+
+    delta_text = "".join(data["content"] for kind, data in live_events if kind == "assistant/delta")
+    assert delta_text == "先查看目录。目录检查完成。"
+    assert [kind for kind, _ in live_events if kind in {"tool/call", "tool/result"}] == [
+        "tool/call",
+        "tool/result",
+    ]
+    assert result.answer == "目录检查完成。"

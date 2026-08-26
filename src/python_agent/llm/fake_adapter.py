@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from typing import Any
 
-from python_agent.llm.types import AssistantResponse, ModelRequest
+from python_agent.llm.types import AssistantResponse, ModelChunk, ModelRequest
 
 ResponseFactory = Callable[[ModelRequest], AssistantResponse | dict[str, Any]]
 
@@ -57,3 +57,29 @@ class FakeAdapter:
             "",
         )
         return AssistantResponse(content=f"Echo: {last_user}", finish_reason="stop")
+
+    async def stream(
+        self,
+        request: ModelRequest,
+        *,
+        cancel_event: asyncio.Event,
+    ) -> AsyncIterator[ModelChunk]:
+        """把完整 Fake 响应切成小片段，模拟真实模型的增量输出。
+
+        Fake Adapter 的脚本仍然按照一次请求返回一个 AssistantResponse；这里只负责把
+        文本拆开，方便测试和 CLI 验证流式显示。工具调用不会被伪造为半截 JSON，而是
+        在最后一个 done 片段中一次性交给 Agent Loop，避免执行不完整的参数。
+        """
+
+        response = await self.complete(request, cancel_event=cancel_event)
+        if response.content:
+            for character in response.content:
+                if cancel_event.is_set():
+                    raise asyncio.CancelledError
+                yield ModelChunk(content=character)
+        yield ModelChunk(
+            tool_calls=response.tool_calls,
+            finish_reason=response.finish_reason,
+            usage=response.usage,
+            done=True,
+        )
