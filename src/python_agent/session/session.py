@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from python_agent.errors import SessionError
@@ -18,8 +18,14 @@ class Session:
     平行副本，从而保证恢复和 replay 的行为是确定性的。
     """
 
-    def __init__(self, header: SessionHeader, events: Iterable[SessionEvent] = ()) -> None:
+    def __init__(
+        self,
+        header: SessionHeader,
+        events: Iterable[SessionEvent] = (),
+        event_listener: Callable[[SessionEvent], None] | None = None,
+    ) -> None:
         self.header = header
+        self.event_listener = event_listener
         self.events: list[SessionEvent] = []
         for event in events:
             self._append_existing(event)
@@ -67,7 +73,18 @@ class Session:
             ignorable=ignorable,
         )
         self.events.append(event)
+        if self.event_listener is not None:
+            self.event_listener(event)
         return event
+
+    def set_event_listener(self, listener: Callable[[SessionEvent], None] | None) -> None:
+        """设置实时事件观察器。
+
+        监听器只接收已经追加成功的事件，不允许替换或阻止事件，因此不会改变 Session
+        作为权威事实源的角色。持久化和回放时可以不设置监听器。
+        """
+
+        self.event_listener = listener
 
     def messages(self) -> list[dict[str, Any]]:
         return derive_messages(self.events)

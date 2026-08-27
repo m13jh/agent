@@ -80,8 +80,59 @@ mypy
 pytest
 ```
 
-当前仅实现阶段 1 的单次 `run(prompt)` API；durable inbox、steer/inject、JSONL 恢复和子
-Agent 属于后续阶段。
+## 阶段 2 Agent Handle
+
+阶段 2提供由 `AgentManager` 持有的 Agent Handle。`followup` 开启新的 Turn，`steer`
+在下一个 Step 注入纠偏信息，`inject` 只写入上下文但不会唤醒 idle Agent：
+
+```python
+import asyncio
+
+from python_agent import AgentManager, FakeAdapter
+
+
+async def main() -> None:
+    manager = AgentManager()
+    agent = await manager.create(FakeAdapter())
+    await agent.inject("这是静默上下文")
+    await agent.followup("请完成任务")
+    await agent.when_idle()
+    print(agent.last_result.answer)
+    await manager.shutdown()
+
+
+asyncio.run(main())
+```
+
+一个 Agent 同时只会拥有一个 Driver Task；所有 Inbox 操作都会记录为
+`agent/inbox/spliced`，因此可以通过事件重放恢复待处理消息。真正的 JSONL 磁盘持久化
+属于后续阶段。
 
 CLI 会实时显示模型文本增量、工具调用和工具结果。DeepSeek 使用 SSE 流式接口；Fake
 Adapter 也会切分文本，用于离线验证同样的显示流程。
+
+## 交互式终端
+
+在真实终端中先激活 `agent` 环境，再启动 chat：
+
+```bash
+conda activate agent
+python-agent chat
+```
+
+交互模式支持以下输入：
+
+```text
+普通文本             → followup，开启新的 Turn
+/steer 内容          → 在下一步纠偏
+/inject 内容         → 写入上下文但不唤醒 idle Agent
+/cancel              → 取消并清空待处理输入
+/cancel keep         → 取消但保留 Inbox
+/status              → 查看 Agent 和 Inbox 状态
+/transcript          → 查看当前 Session
+/wait                → 等待当前任务完成
+/exit                → 退出
+```
+
+模型在后台运行时仍然可以输入下一条 followup 或 steer；实时输出由 Live Event Bus
+转发到终端。

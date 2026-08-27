@@ -213,8 +213,7 @@ class DeepSeekAdapter:
             raise ModelError(f"DeepSeek streaming request failed: {exc}") from exc
 
         calls = [
-            self._finish_stream_call(index, parts)
-            for index, parts in sorted(call_parts.items())
+            self._finish_stream_call(index, parts) for index, parts in sorted(call_parts.items())
         ]
         yield ModelChunk(
             tool_calls=calls,

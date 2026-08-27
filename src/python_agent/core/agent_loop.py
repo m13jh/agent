@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 from python_agent.config import AgentPreset
+from python_agent.core.inbox import UserMessage
 from python_agent.ids import new_message_id
 from python_agent.llm.adapter import ModelAdapter, ModelRouter
 from python_agent.llm.types import (
@@ -25,7 +26,8 @@ from python_agent.tools.registry import ToolRegistry
 from python_agent.tools.runtime import ToolRuntime
 from python_agent.tools.types import ToolContext
 
-EventHandler = Callable[[str, dict[str, Any]], None]
+EventHandler = Callable[[str, dict[str, Any]], None | Awaitable[None]]
+StepInputProvider = Callable[[], list[UserMessage]]
 
 
 @dataclass(slots=True)
@@ -80,6 +82,11 @@ class AgentLoop:
 
         self.cancel_event.set()
 
+    def reset_cancel(self) -> None:
+        """在上一个 Driver 已经收敛后清除取消信号，允许下一个 Turn 重新运行。"""
+
+        self.cancel_event.clear()
+
     def _resolve_adapter(self) -> ModelAdapter:
         if isinstance(self.adapter, ModelRouter):
             return self.adapter.resolve(self.config.provider)
@@ -117,11 +124,13 @@ class AgentLoop:
             temperature=self.config.temperature,
         )
 
-    def _emit(self, event_type: str, data: dict[str, Any]) -> None:
+    async def _emit(self, event_type: str, data: dict[str, Any]) -> None:
         """把实时观察事件交给 CLI 或上层 UI，不改变 Session 的权威事实。"""
 
         if self.event_handler is not None:
-            self.event_handler(event_type, data)
+            result = self.event_handler(event_type, data)
+            if isinstance(result, Awaitable):
+                await result
 
     async def _complete_response(
         self,
@@ -155,7 +164,7 @@ class AgentLoop:
             )
             if chunk.content:
                 content_parts.append(chunk.content)
-                self._emit(
+                await self._emit(
                     "assistant/delta",
                     {"turn": turn, "step": step, "content": chunk.content},
                 )
@@ -174,6 +183,16 @@ class AgentLoop:
         return response, True
 
     async def run(self, prompt: str) -> RunResult:
+        """执行一个没有外部 Inbox 的独立 Turn，保持阶段 1 的兼容 API。"""
+
+        return await self.run_turn(prompt)
+
+    async def run_turn(
+        self,
+        prompt: str,
+        *,
+        step_input_provider: StepInputProvider | None = None,
+    ) -> RunResult:
         """运行用户 prompt，直到模型给出最终回答或达到配置的步骤上限。
 
         每个步骤都会先写入 ``step/start`` 和 request/header，再调用模型；模型回答、工具
@@ -189,6 +208,7 @@ class AgentLoop:
         last_answer = ""
         adapter = self._resolve_adapter()
         prompt_pending = True
+        pending_step_messages: list[UserMessage] = []
 
         try:
             # 1. 通过经典 for 循环限制最大步骤数，防止模型和工具陷入死循环。
@@ -208,6 +228,20 @@ class AgentLoop:
                         )
                         prompt_pending = False
                     # 4. 从 Session 事件投影消息，并组装本次请求和工具 Schema。
+                    #    Driver 提供的 steer/inject 会在这里进入下一个模型请求。
+                    step_inputs = pending_step_messages
+                    pending_step_messages = []
+                    if step_input_provider is not None:
+                        step_inputs.extend(step_input_provider())
+                    for message in step_inputs:
+                        self.session.append(
+                            "user/message",
+                            {
+                                "message_id": str(message.message_id),
+                                "content": message.content,
+                                "input_kind": message.kind,
+                            },
+                        )
                     request = self._request()
                     self.session.append(
                         "request/header",
@@ -236,9 +270,18 @@ class AgentLoop:
                         "streamed": streamed,
                     }
                     self.session.append("assistant/message", assistant_event_data)
-                    self._emit("assistant/message", assistant_event_data)
+                    await self._emit("assistant/message", assistant_event_data)
 
                     if not response.tool_calls:
+                        if step_input_provider is not None:
+                            pending_step_messages = step_input_provider()
+                        if pending_step_messages:
+                            self.session.append(
+                                "step/end",
+                                {"turn": turn, "step": step, "reason": "next_step_input"},
+                            )
+                            step_closed = True
+                            continue
                         reason = "max_tokens" if response.finish_reason == "length" else "completed"
                         self.session.append(
                             "step/end",
@@ -249,6 +292,7 @@ class AgentLoop:
                         return RunResult(last_answer, self.session, response.finish_reason)
 
                     # 6. 模型要求工具时，先记录并通知调用方，再交给 ToolRuntime 串行执行。
+                    concluded_with_pending_input = False
                     for call in response.tool_calls:
                         tool_call_event_data = {
                             "turn": turn,
@@ -261,7 +305,7 @@ class AgentLoop:
                             "tool/call",
                             tool_call_event_data,
                         )
-                        self._emit("tool/call", tool_call_event_data)
+                        await self._emit("tool/call", tool_call_event_data)
                         result = await self._runtime.execute(
                             call,
                             ToolContext(
@@ -272,8 +316,22 @@ class AgentLoop:
                         )
                         tool_result_event_data = result.event_data()
                         self.session.append("tool/result", tool_result_event_data)
-                        self._emit("tool/result", tool_result_event_data)
+                        await self._emit("tool/result", tool_result_event_data)
                         if result.concludes_turn:
+                            if step_input_provider is not None:
+                                pending_step_messages = step_input_provider()
+                            if pending_step_messages:
+                                self.session.append(
+                                    "step/end",
+                                    {
+                                        "turn": turn,
+                                        "step": step,
+                                        "reason": "next_step_input",
+                                    },
+                                )
+                                step_closed = True
+                                concluded_with_pending_input = True
+                                break
                             self.session.append(
                                 "step/end",
                                 {"turn": turn, "step": step, "reason": "tool_concluded"},
@@ -289,6 +347,8 @@ class AgentLoop:
                                 "tool_concluded",
                             )
 
+                    if concluded_with_pending_input:
+                        continue
                     self.session.append(
                         "step/end",
                         {"turn": turn, "step": step, "reason": "tool_calls"},
