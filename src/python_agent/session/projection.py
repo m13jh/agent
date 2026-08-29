@@ -112,6 +112,8 @@ def derive_messages(events: list[SessionEvent] | tuple[SessionEvent, ...]) -> li
             "assistant/chunk",
             "agent/inbox/spliced",
             "request/header",
+            "request/error",
+            "request/retry",
             "tool/write_intent",
             "todo/write",
         }:

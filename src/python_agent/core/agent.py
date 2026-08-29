@@ -14,6 +14,7 @@ from python_agent.core.lifecycle import AgentStatus, CancelCause
 from python_agent.hooks.event_bus import LiveEventBus
 from python_agent.ids import MessageId, SessionId
 from python_agent.llm.adapter import ModelAdapter, ModelRouter
+from python_agent.llm.retry import ModelRetryPolicy
 from python_agent.session.events import SessionEvent
 from python_agent.session.session import Session
 from python_agent.tools.policies import ExecuteHandler, PostHandler, PreHandler
@@ -44,6 +45,7 @@ class Agent:
         pre_policies: tuple[PreHandler, ...] = (),
         execute_policies: tuple[ExecuteHandler, ...] = (),
         post_policies: tuple[PostHandler, ...] = (),
+        request_retry_policy: ModelRetryPolicy | None = None,
         recover_orphaned_claims: bool = False,
     ) -> None:
         """创建一个长期存活的 Handle，并把所有 Driver 相关资源绑定到本实例。
@@ -78,6 +80,7 @@ class Agent:
             pre_policies=pre_policies,
             execute_policies=execute_policies,
             post_policies=post_policies,
+            request_retry_policy=request_retry_policy,
         )
         self._status: AgentStatus = "idle"
         self._driver_task: asyncio.Task[None] | None = None

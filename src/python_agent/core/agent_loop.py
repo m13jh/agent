@@ -12,8 +12,15 @@ from typing import Any, Literal
 from python_agent.approval.service import ApprovalService
 from python_agent.config import AgentPreset
 from python_agent.core.inbox import UserMessage
+from python_agent.core.limits import BudgetExceededError, BudgetViolation, TurnBudget
 from python_agent.ids import new_message_id
 from python_agent.llm.adapter import ModelAdapter, ModelRouter
+from python_agent.llm.retry import (
+    DefaultModelRetryPolicy,
+    ModelRetryContext,
+    ModelRetryPolicy,
+    RetryDecision,
+)
 from python_agent.llm.types import (
     AssistantResponse,
     ModelChunk,
@@ -27,7 +34,7 @@ from python_agent.session.session import Session
 from python_agent.tools.policies import ExecuteHandler, PostHandler, PreHandler
 from python_agent.tools.registry import ToolRegistry
 from python_agent.tools.runtime import ToolRuntime
-from python_agent.tools.types import ToolContext
+from python_agent.tools.types import ToolContext, ToolResult
 
 EventHandler = Callable[[str, dict[str, Any]], None | Awaitable[None]]
 StepInputProvider = Callable[[], list[UserMessage]]
@@ -61,6 +68,7 @@ class ModelRequestStatus:
     step: int
     provider: str
     model: str
+    attempt: int
     elapsed_seconds: float
 
 
@@ -88,6 +96,7 @@ class AgentLoop:
         pre_policies: tuple[PreHandler, ...] = (),
         execute_policies: tuple[ExecuteHandler, ...] = (),
         post_policies: tuple[PostHandler, ...] = (),
+        request_retry_policy: ModelRetryPolicy | None = None,
     ) -> None:
         """创建单次循环。
 
@@ -108,6 +117,7 @@ class AgentLoop:
         self._runtime = ToolRuntime(
             self.tools,
             max_result_chars=self.config.max_tool_result_chars,
+            max_parallel_tools=self.config.max_parallel_tools,
             spill_directory=spill_directory,
             approval_service=approval_service,
             approval_required=(
@@ -117,10 +127,13 @@ class AgentLoop:
             execute_policies=execute_policies,
             post_policies=post_policies,
         )
+        self.request_retry_policy = request_retry_policy or DefaultModelRetryPolicy(
+            self.config.model_retry_base_delay_seconds
+        )
         self.event_handler = event_handler
         # 只保存当前正在 await 的一次模型请求；单 Driver 规则保证同一 Agent 不会同时
         # 出现两个活动请求。开始时间使用 monotonic clock，不受系统时间校准影响。
-        self._active_request: tuple[int, int, str, str, float] | None = None
+        self._active_request: tuple[int, int, str, str, int, float] | None = None
 
     @property
     def active_request(self) -> ModelRequestStatus | None:
@@ -128,12 +141,13 @@ class AgentLoop:
 
         if self._active_request is None:
             return None
-        turn, step, provider, model, started_at = self._active_request
+        turn, step, provider, model, attempt, started_at = self._active_request
         return ModelRequestStatus(
             turn=turn,
             step=step,
             provider=provider,
             model=model,
+            attempt=attempt,
             elapsed_seconds=max(0.0, time.monotonic() - started_at),
         )
 
@@ -267,6 +281,7 @@ class AgentLoop:
         *,
         turn: int,
         step: int,
+        attempt: int = 1,
     ) -> tuple[AssistantResponse, bool]:
         """包装模型请求，发布开始/结束通知并维护可查询的实时状态。
 
@@ -281,6 +296,7 @@ class AgentLoop:
             step,
             request.provider,
             request.model,
+            attempt,
             started_at,
         )
         status = "completed"
@@ -294,6 +310,7 @@ class AgentLoop:
                     "step": step,
                     "provider": request.provider,
                     "model": request.model,
+                    "attempt": attempt,
                     "message_count": len(request.messages),
                     "tool_count": len(request.tools),
                 },
@@ -324,12 +341,121 @@ class AgentLoop:
                     "step": step,
                     "provider": request.provider,
                     "model": request.model,
+                    "attempt": attempt,
                     "status": status,
                     "finish_reason": finish_reason,
                     "error_type": error_type,
                     "duration_ms": duration_ms,
                 },
             )
+
+    async def _request_with_retries(
+        self,
+        adapter: ModelAdapter,
+        request: ModelRequest,
+        *,
+        turn: int,
+        step: int,
+        budget: TurnBudget,
+    ) -> tuple[AssistantResponse, bool]:
+        """在 Turn 墙钟预算内执行模型请求，并让策略决定有限重试。
+
+        每次失败都会持久化 ``request/error``；只有策略批准时再追加 ``request/retry``。
+        重试不会复制 user/message 或打开新 Step，因此恢复后的模型历史仍然只包含一次
+        语义请求。每个网络尝试都有独立的实时开始/结束与耗时事件。
+        """
+
+        attempt = 1
+        while True:
+            remaining = budget.remaining_wall_seconds
+            if remaining is not None and remaining <= 0:
+                raise BudgetExceededError(
+                    BudgetViolation("wall_time", "模型请求开始前 Turn 墙钟预算已经耗尽")
+                )
+            try:
+                operation = self._request_with_status(
+                    adapter,
+                    request,
+                    turn=turn,
+                    step=step,
+                    attempt=attempt,
+                )
+                if remaining is None:
+                    return await operation
+                try:
+                    return await asyncio.wait_for(operation, timeout=remaining)
+                except asyncio.TimeoutError as exc:
+                    raise BudgetExceededError(
+                        BudgetViolation(
+                            "wall_time",
+                            f"模型请求超过 Turn 剩余墙钟预算 {remaining:.3f}s",
+                        )
+                    ) from exc
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if isinstance(exc, BudgetExceededError):
+                    decision = RetryDecision(False, reason="Turn 预算错误不允许重试")
+                else:
+                    context = ModelRetryContext(
+                        request=request,
+                        error=exc,
+                        attempt=attempt,
+                        max_retries=self.config.model_max_retries,
+                        elapsed_seconds=budget.elapsed_seconds,
+                    )
+                    try:
+                        decision = await self.request_retry_policy.decide(context)
+                    except Exception as policy_error:
+                        decision = RetryDecision(
+                            False,
+                            reason=f"重试策略异常：{type(policy_error).__name__}",
+                        )
+
+                error_data = {
+                    "turn": turn,
+                    "step": step,
+                    "attempt": attempt,
+                    "provider": request.provider,
+                    "model": request.model,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc)[:2000],
+                    "will_retry": decision.retry,
+                    "delay_seconds": max(0.0, decision.delay_seconds),
+                    "reason": decision.reason,
+                }
+                # 请求诊断不改变模型消息语义，标记 ignorable 让旧投影器也能安全跳过。
+                self.session.append("request/error", error_data, ignorable=True)
+                await self._emit("model/request_error", error_data)
+                if not decision.retry:
+                    raise
+
+                delay = max(0.0, decision.delay_seconds)
+                remaining = budget.remaining_wall_seconds
+                if remaining is not None and delay >= remaining:
+                    raise BudgetExceededError(
+                        BudgetViolation(
+                            "wall_time",
+                            "模型重试退避时间将耗尽 Turn 剩余墙钟预算",
+                        )
+                    ) from exc
+                retry_data = {
+                    "turn": turn,
+                    "step": step,
+                    "next_attempt": attempt + 1,
+                    "delay_seconds": delay,
+                    "reason": decision.reason,
+                }
+                self.session.append("request/retry", retry_data, ignorable=True)
+                await self._emit("model/request_retry", retry_data)
+                if delay > 0:
+                    try:
+                        await asyncio.wait_for(self.cancel_event.wait(), timeout=delay)
+                    except asyncio.TimeoutError:
+                        pass
+                    else:
+                        raise asyncio.CancelledError
+                attempt += 1
 
     async def run(self, prompt: str) -> RunResult:
         """执行一个没有外部 Inbox 的独立 Turn，保持阶段 1 的兼容 API。"""
@@ -360,6 +486,7 @@ class AgentLoop:
         )
         prompt_kind = prompt.kind if isinstance(prompt, UserMessage) else "followup"
 
+        budget = TurnBudget(self.config)
         turn = self.session.next_turn()
         self.session.append("turn/start", {"turn": turn})
         last_answer = ""
@@ -367,17 +494,60 @@ class AgentLoop:
         prompt_pending = True
         pending_step_messages: list[UserMessage] = []
 
+        def append_turn_end(reason: str, *, limit: BudgetViolation | None = None) -> None:
+            """统一关闭 Turn，并把阶段五累计预算快照写入权威日志。"""
+
+            data: dict[str, Any] = {
+                "turn": turn,
+                "reason": reason,
+                "budget": budget.snapshot().event_data(),
+            }
+            if limit is not None:
+                data["limit"] = {"reason": limit.reason, "message": limit.message}
+            self.session.append("turn/end", data)
+
+        async def finish_for_limit(
+            violation: BudgetViolation,
+            *,
+            step: int | None = None,
+        ) -> RunResult:
+            """在可选 Step 边界记录限制，关闭 Turn 并返回正常的 RunResult。"""
+
+            limit_data = {
+                "turn": turn,
+                "step": step,
+                "reason": violation.reason,
+                "message": violation.message,
+                "budget": budget.snapshot().event_data(),
+            }
+            if step is not None:
+                self.session.append(
+                    "step/end",
+                    {
+                        "turn": turn,
+                        "step": step,
+                        "reason": violation.reason,
+                        "limit": violation.message,
+                    },
+                )
+            await self._emit("agent/limit", limit_data)
+            append_turn_end(violation.reason, limit=violation)
+            return RunResult(last_answer, self.session, violation.reason)
+
         try:
-            # 1. 通过经典 for 循环限制最大步骤数，防止模型和工具陷入死循环。
+            # 1. max_steps 提供硬循环上限，其余预算在每个 Step 边界动态检查。
             for _ in range(self.config.max_steps):
-                # 2. 每次发起新的 Step 前检查协作式取消信号。
                 if self.cancel_event.is_set():
                     raise asyncio.CancelledError
+                boundary_violation = budget.check_boundary()
+                if boundary_violation is not None:
+                    return await finish_for_limit(boundary_violation)
+
                 step = self.session.next_step()
                 self.session.append("step/start", {"turn": turn, "step": step})
                 step_closed = False
                 try:
-                    # 3. 第一次循环时把用户 prompt 写入 Session；后续循环只追加工具结果。
+                    # 2. 第一次循环写主 prompt；后续 Step 只消费 steer/inject 和工具结果。
                     if prompt_pending:
                         self.session.append(
                             "user/message",
@@ -388,8 +558,6 @@ class AgentLoop:
                             },
                         )
                         prompt_pending = False
-                    # 4. 从 Session 事件投影消息，并组装本次请求和工具 Schema。
-                    #    Driver 提供的 steer/inject 会在这里进入下一个模型请求。
                     step_inputs = pending_step_messages
                     pending_step_messages = []
                     if step_input_provider is not None:
@@ -403,7 +571,16 @@ class AgentLoop:
                                 "input_kind": message.kind,
                             },
                         )
+
+                    # 3. request/header 记录稳定请求配置和发起前预算，重试本身不复制消息。
                     request = self._request()
+                    remaining_tokens = budget.remaining_tokens
+                    if remaining_tokens is not None:
+                        # 无 Provider tokenizer 时无法预知下一请求的 prompt_tokens，但至少把
+                        # completion 上限压到剩余总预算以内，避免一次输出造成无界超支。
+                        request = request.model_copy(
+                            update={"max_tokens": min(request.max_tokens, remaining_tokens)}
+                        )
                     self.session.append(
                         "request/header",
                         {
@@ -413,15 +590,24 @@ class AgentLoop:
                             "model": request.model,
                             "system": request.system,
                             "tools": request.tools,
+                            "max_tokens": request.max_tokens,
+                            "temperature": request.temperature,
+                            "max_retries": self.config.model_max_retries,
+                            "budget_before": budget.snapshot().event_data(),
                         },
                     )
-                    # 5. 发起模型请求：优先使用流式 stream()，否则回退到 complete()。
-                    response, streamed = await self._request_with_status(
-                        adapter,
-                        request,
-                        turn=turn,
-                        step=step,
-                    )
+                    try:
+                        response, streamed = await self._request_with_retries(
+                            adapter,
+                            request,
+                            turn=turn,
+                            step=step,
+                            budget=budget,
+                        )
+                    except BudgetExceededError as exc:
+                        step_closed = True
+                        return await finish_for_limit(exc.violation, step=step)
+
                     last_answer = response.content or ""
                     assistant_event_data = {
                         "content": response.content,
@@ -432,9 +618,13 @@ class AgentLoop:
                     }
                     self.session.append("assistant/message", assistant_event_data)
                     await self._emit("assistant/message", assistant_event_data)
+                    usage_violation = budget.record_usage(response.usage)
 
                     if not response.tool_calls:
-                        # 模型自然结束前再检查一次 next_step，捕获模型请求期间到达的 steer。
+                        if usage_violation is not None:
+                            step_closed = True
+                            return await finish_for_limit(usage_violation, step=step)
+                        # 模型自然结束前再检查 next_step，捕获模型请求期间到达的 steer。
                         if step_input_provider is not None:
                             pending_step_messages = step_input_provider()
                         if pending_step_messages:
@@ -450,11 +640,10 @@ class AgentLoop:
                             {"turn": turn, "step": step, "reason": reason},
                         )
                         step_closed = True
-                        self.session.append("turn/end", {"turn": turn, "reason": reason})
+                        append_turn_end(reason)
                         return RunResult(last_answer, self.session, response.finish_reason)
 
-                    # 6. 模型要求工具时，先记录并通知调用方，再交给 ToolRuntime 串行执行。
-                    concluded_with_pending_input = False
+                    # 4. 先按模型顺序记录全部 call，再允许 Runtime 并发执行，确保审计完整。
                     for call in response.tool_calls:
                         tool_call_event_data = {
                             "turn": turn,
@@ -463,59 +652,111 @@ class AgentLoop:
                             "name": call.name,
                             "arguments": call.arguments,
                         }
-                        self.session.append(
-                            "tool/call",
-                            tool_call_event_data,
-                        )
+                        self.session.append("tool/call", tool_call_event_data)
                         await self._emit("tool/call", tool_call_event_data)
                         if call.name in {"write_file", "apply_patch"}:
-                            # 在进入写工具主体前留下不可变的 intent，便于审批、审计和回放。
                             self.session.append("tool/write_intent", tool_call_event_data)
                             await self._emit("tool/write_intent", tool_call_event_data)
-                        result = await self._runtime.execute(
-                            call,
-                            ToolContext(
-                                session_id=self.session.id,
-                                workspace=self.session.header.cwd,
-                                cancel_event=self.cancel_event,
-                                permission_mode=self.config.permission_mode,
-                            ),
-                        )
+
+                    tool_context = ToolContext(
+                        session_id=self.session.id,
+                        workspace=self.session.header.cwd,
+                        cancel_event=self.cancel_event,
+                        permission_mode=self.config.permission_mode,
+                    )
+                    tool_violation = usage_violation
+                    if tool_violation is not None:
+                        tool_results = [
+                            ToolResult(
+                                call_id=call.id,
+                                name=call.name,
+                                content=f"工具未执行：{tool_violation.message}",
+                                is_error=True,
+                            )
+                            for call in response.tool_calls
+                        ]
+                    else:
+                        remaining = budget.remaining_wall_seconds
+                        if remaining is not None and remaining <= 0:
+                            tool_violation = BudgetViolation(
+                                "wall_time",
+                                "工具开始前 Turn 墙钟预算已经耗尽",
+                            )
+                            tool_results = [
+                                ToolResult(
+                                    call_id=call.id,
+                                    name=call.name,
+                                    content=f"工具未执行：{tool_violation.message}",
+                                    is_error=True,
+                                )
+                                for call in response.tool_calls
+                            ]
+                        else:
+                            operation = self._runtime.execute_many(
+                                response.tool_calls,
+                                tool_context,
+                            )
+                            try:
+                                tool_results = (
+                                    await operation
+                                    if remaining is None
+                                    else await asyncio.wait_for(operation, timeout=remaining)
+                                )
+                            except asyncio.TimeoutError:
+                                tool_violation = BudgetViolation(
+                                    "wall_time",
+                                    "工具组执行超过 Turn 剩余墙钟预算",
+                                )
+                                tool_results = [
+                                    ToolResult(
+                                        call_id=call.id,
+                                        name=call.name,
+                                        content=f"工具执行被预算取消：{tool_violation.message}",
+                                        is_error=True,
+                                    )
+                                    for call in response.tool_calls
+                                ]
+
+                    # 5. Runtime 返回值已恢复模型顺序；事件提交顺序不受实际完成先后影响。
+                    for result in tool_results:
                         tool_result_event_data = result.event_data()
                         self.session.append("tool/result", tool_result_event_data)
                         await self._emit("tool/result", tool_result_event_data)
-                        if result.concludes_turn:
-                            if step_input_provider is not None:
-                                pending_step_messages = step_input_provider()
-                            if pending_step_messages:
-                                self.session.append(
-                                    "step/end",
-                                    {
-                                        "turn": turn,
-                                        "step": step,
-                                        "reason": "next_step_input",
-                                    },
-                                )
-                                step_closed = True
-                                concluded_with_pending_input = True
-                                break
+
+                    if tool_violation is None:
+                        tool_violation = budget.check_boundary()
+                    if tool_violation is not None:
+                        step_closed = True
+                        return await finish_for_limit(tool_violation, step=step)
+                    if self.cancel_event.is_set():
+                        raise asyncio.CancelledError
+
+                    concluding_result = next(
+                        (result for result in tool_results if result.concludes_turn),
+                        None,
+                    )
+                    if concluding_result is not None:
+                        if step_input_provider is not None:
+                            pending_step_messages = step_input_provider()
+                        if pending_step_messages:
                             self.session.append(
                                 "step/end",
-                                {"turn": turn, "step": step, "reason": "tool_concluded"},
+                                {"turn": turn, "step": step, "reason": "next_step_input"},
                             )
                             step_closed = True
-                            self.session.append(
-                                "turn/end",
-                                {"turn": turn, "reason": "tool_concluded"},
-                            )
-                            return RunResult(
-                                last_answer or str(result.content),
-                                self.session,
-                                "tool_concluded",
-                            )
+                            continue
+                        self.session.append(
+                            "step/end",
+                            {"turn": turn, "step": step, "reason": "tool_concluded"},
+                        )
+                        step_closed = True
+                        append_turn_end("tool_concluded")
+                        return RunResult(
+                            last_answer or str(concluding_result.content),
+                            self.session,
+                            "tool_concluded",
+                        )
 
-                    if concluded_with_pending_input:
-                        continue
                     self.session.append(
                         "step/end",
                         {"turn": turn, "step": step, "reason": "tool_calls"},
@@ -536,11 +777,11 @@ class AgentLoop:
                         )
                     raise
 
-            self.session.append("turn/end", {"turn": turn, "reason": "max_steps"})
+            append_turn_end("max_steps")
             return RunResult(last_answer, self.session, "max_steps")
         except asyncio.CancelledError:
-            self.session.append("turn/end", {"turn": turn, "reason": "aborted"})
+            append_turn_end("aborted")
             raise
         except Exception:
-            self.session.append("turn/end", {"turn": turn, "reason": "error"})
+            append_turn_end("error")
             raise

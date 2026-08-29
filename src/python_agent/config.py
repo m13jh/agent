@@ -27,6 +27,49 @@ class AgentPreset(BaseModel):
     max_steps: int = Field(default=30, gt=0, description="一个 Turn 最多执行的模型步骤数")
     max_tokens: int = Field(default=2048, gt=0, description="单次模型响应的最大输出 Token 数")
     temperature: float = Field(default=0.0, ge=0.0, le=2.0, description="模型采样温度")
+    max_parallel_tools: int = Field(
+        default=4,
+        gt=0,
+        le=64,
+        description="同一批并发安全工具最多同时执行的数量",
+    )
+    max_turn_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        description="一个 Turn 内所有模型请求累计允许消耗的总 Token；None 表示不限制",
+    )
+    max_turn_cost_usd: float | None = Field(
+        default=None,
+        gt=0,
+        description="一个 Turn 的最大美元费用；需要 Provider cost 或显式 Token 单价",
+    )
+    max_turn_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        description="一个 Turn 从开始到结束允许占用的最大墙钟秒数",
+    )
+    input_cost_per_million_tokens: float | None = Field(
+        default=None,
+        ge=0,
+        description="Provider 未返回费用时，用于估算输入 Token 成本的每百万 Token 单价",
+    )
+    output_cost_per_million_tokens: float | None = Field(
+        default=None,
+        ge=0,
+        description="Provider 未返回费用时，用于估算输出 Token 成本的每百万 Token 单价",
+    )
+    model_max_retries: int = Field(
+        default=2,
+        ge=0,
+        le=10,
+        description="一次 Step 的模型请求失败后最多重试次数，不含首次请求",
+    )
+    model_retry_base_delay_seconds: float = Field(
+        default=0.5,
+        ge=0,
+        le=60,
+        description="模型重试指数退避的基础秒数",
+    )
     max_tool_result_chars: int = Field(
         default=12000,
         gt=0,

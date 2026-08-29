@@ -11,6 +11,7 @@ from python_agent.core.agent_manager import AgentManager
 from python_agent.core.lifecycle import CancelCause
 from python_agent.hooks.event_bus import LiveEventBus
 from python_agent.llm.fake_adapter import FakeAdapter
+from python_agent.llm.retry import DefaultModelRetryPolicy, ModelRetryPolicy, RetryDecision
 from python_agent.session.jsonl_store import JsonlSessionStore
 from python_agent.session.session import Session
 from python_agent.session.store import SessionStore
@@ -21,10 +22,13 @@ __all__ = [
     "AgentManager",
     "AgentPreset",
     "CancelCause",
+    "DefaultModelRetryPolicy",
     "FakeAdapter",
     "JsonlSessionStore",
     "LiveEventBus",
     "ModelRequestStatus",
+    "ModelRetryPolicy",
+    "RetryDecision",
     "RunResult",
     "Session",
     "SessionStore",

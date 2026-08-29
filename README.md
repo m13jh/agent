@@ -1,8 +1,8 @@
 # python-agent
 
 `python-agent` 是一个小而清晰的原生 Python Agent Harness。当前版本已完成架构文档中的
-阶段 0—4：除“模型 → 工具 → 模型”闭环、Agent Handle 和安全工具流水线外，还提供
-JSONL Session 持久化、崩溃恢复、Inbox 重放和 transcript 导出。
+阶段 0—5：除“模型 → 工具 → 模型”闭环、Agent Handle 和安全工具流水线外，还提供
+JSONL Session 持久化、崩溃恢复、有界工具并发、Turn 预算和模型请求有限重试。
 
 ## 安装
 
@@ -231,6 +231,41 @@ session_id = agent.id
 # 进程重启后：重放 Inbox；存在可唤醒消息时自动恢复单 Driver。
 agent = await manager.resume(session_id, FakeAdapter())
 ```
+
+## 阶段 5 并发、预算与模型重试
+
+同一模型响应中的工具不再全部串行执行。工具通过
+`is_concurrency_safe(arguments)` 声明本次调用是否可并发：连续只读调用进入有界滚动池，
+写入、Bash 或其他 exclusive 工具形成屏障。调用可以乱序完成，但 `tool/result` 始终按
+模型给出的 call 顺序写入 Session。取消时会排空所有已创建 Task，并为每个 call 生成结果。
+
+CLI 可以配置并发数和 Turn 级预算：
+
+```bash
+python-agent chat \
+  --max-parallel-tools 4 \
+  --max-turn-tokens 20000 \
+  --max-turn-seconds 300 \
+  --model-max-retries 2 \
+  --model-retry-base-delay-seconds 0.5
+```
+
+费用预算优先使用 Provider 在 usage 中返回的费用；Provider 不返回时可以显式配置单价：
+
+```bash
+python-agent run "执行受预算限制的任务" \
+  --max-turn-cost-usd 0.10 \
+  --input-cost-per-million-tokens 0.50 \
+  --output-cost-per-million-tokens 2.00
+```
+
+预算达到后，Agent 会以 `token_budget`、`cost_budget` 或 `wall_time` 正常关闭 Turn，并把
+累计 Token、费用和耗时写入 `turn/end`。如果模型已返回工具调用但预算不足，所有调用都会
+得到明确的错误 `tool/result`，工具主体不会执行。
+
+模型请求失败会写入 `request/error`；默认策略对传输/响应错误有限指数退避，对认证、配额
+和请求参数错误不重试。每次获准重试还会写入 `request/retry`，但不会复制 user/message 或
+创建额外 Step。应用可以通过 `request_retry_policy` 注入自己的异步决策策略。
 
 ## 待改进清单
 

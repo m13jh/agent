@@ -14,18 +14,19 @@
 - 阶段 2扩展：python-agent chat 交互式终端和流式文本显示。
 - 阶段 4：JSONL SessionStore、严格版本/序号校验、Inbox 重放、Session resume、
   transcript 导出，以及物理/语义崩溃尾部的保守修复。
+- 阶段 5：有界 parallel/exclusive 工具调度、模型顺序结果提交、Turn 级 Token/费用/
+  wall-time 预算，以及可注入的模型请求有限重试策略。
 
 当前全量检查基线：
 
 ~~~text
 ruff：通过
 mypy：通过
-pytest：42 passed
+pytest：56 passed
 ~~~
 
 以下功能属于架构文档后续阶段，本文不把它们误记为当前缺陷：
 
-- 阶段 5：工具并发调度、费用和 wall-time 预算、模型请求重试策略的完整版本。
 - 阶段 6：进程内子 Agent。
 - 阶段 7：上下文压缩、Session fork、Skills、SQLite、Web API/UI。
 
@@ -82,7 +83,7 @@ arguments = json.loads(parts["arguments"])
 - 工具主体没有执行，文件没有被部分写入，这是安全的。
 - Agent Driver 会收到 ModelError，并结束本次任务。
 - 用户看不到明确的“输出达到上限”或“网络流提前断开”提示。
-- 没有自动重试、续写或重新组织工具调用。
+- 事故发生时没有自动重试；阶段 5 已加入通用有限重试，但仍不能续写半截工具参数。
 
 ## 3. 与 deepseek-harness 的实现差异
 
@@ -204,6 +205,10 @@ context_window：输入 + 输出的总上下文容量
 ~~~
 
 ### P0-4：增加模型请求错误恢复策略
+
+阶段 5 已完成通用部分：`request/error`、`request/retry`、可注入异步策略、有限指数退避、
+墙钟预算与取消协同均已实现。这里剩余的是把 P0-1/P0-2 的结构化 SSE 错误码接入策略，
+从而精确区分缺少 DONE、max_tokens、畸形工具参数和普通传输错误。
 
 建议流程：
 
@@ -344,13 +349,13 @@ P0-2 完整响应/finish reason 错误分类
     ↓
 P0-3 max_tokens CLI 和 .env 配置
     ↓
-P0-4 request-error 恢复和有限重试
+P0-4 结构化错误码接入现有重试策略
     ↓
 P0-5 大工具调用集成测试
     ↓
 P1-1/P1-2 上下文和工具输出治理
     ↓
-阶段 5 工具并发与运行预算
+阶段 6 进程内子 Agent
 ~~~
 
 ## 9. 待确认的产品策略

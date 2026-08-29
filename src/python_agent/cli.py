@@ -53,9 +53,32 @@ def _display_event(event_type: str, data: dict[str, Any]) -> None:
     """
 
     if event_type == "model/request_start":
+        raw_attempt = data.get("attempt", 1)
+        attempt = raw_attempt if isinstance(raw_attempt, int) else 1
+        attempt_text = f"，尝试 {attempt}" if attempt > 1 else ""
         print(
             f"\n[模型请求] Turn {data.get('turn')} / Step {data.get('step')} → "
-            f"{data.get('provider')}/{data.get('model')}，正在等待响应……",
+            f"{data.get('provider')}/{data.get('model')}{attempt_text}，正在等待响应……",
+            flush=True,
+        )
+        return
+    if event_type == "model/request_error":
+        if data.get("will_retry"):
+            print(
+                f"[请求错误] {data.get('error_type')}；将在 "
+                f"{data.get('delay_seconds', 0)} 秒后重试。",
+                flush=True,
+            )
+        return
+    if event_type == "model/request_retry":
+        print(
+            f"[模型重试] 即将开始第 {data.get('next_attempt')} 次尝试：{data.get('reason')}",
+            flush=True,
+        )
+        return
+    if event_type == "agent/limit":
+        print(
+            f"\n[预算终止] {data.get('reason')}：{data.get('message')}",
             flush=True,
         )
         return
@@ -149,6 +172,29 @@ def _add_agent_options(command: argparse.ArgumentParser) -> None:
     command.add_argument("--model", default=None)
     command.add_argument("--workspace", type=Path, default=Path.cwd())
     command.add_argument("--max-steps", type=int, default=30)
+    command.add_argument("--max-parallel-tools", type=int, default=4)
+    command.add_argument(
+        "--max-turn-tokens",
+        type=int,
+        default=None,
+        help="maximum cumulative model tokens in one Turn",
+    )
+    command.add_argument(
+        "--max-turn-seconds",
+        type=float,
+        default=None,
+        help="maximum wall-clock seconds in one Turn",
+    )
+    command.add_argument(
+        "--max-turn-cost-usd",
+        type=float,
+        default=None,
+        help="maximum estimated/provider-reported USD cost in one Turn",
+    )
+    command.add_argument("--input-cost-per-million-tokens", type=float, default=None)
+    command.add_argument("--output-cost-per-million-tokens", type=float, default=None)
+    command.add_argument("--model-max-retries", type=int, default=2)
+    command.add_argument("--model-retry-base-delay-seconds", type=float, default=0.5)
     command.add_argument(
         "--session-root",
         type=Path,
@@ -245,11 +291,34 @@ async def _create_agent(args: argparse.Namespace) -> tuple[AgentManager, Agent]:
     # CLI 没有独立的 preset 配置文件，因此把影响恢复能力的关键选项编码进稳定 ID。
     # 用户若用不同 Provider、模型、权限或步数恢复，Manager 会因 ID 不匹配而明确拒绝。
     preset_id = f"cli-v1:{args.provider}:{model}:{args.permission_mode}:steps={args.max_steps}"
+    phase5_values = (
+        args.max_parallel_tools,
+        args.max_turn_tokens,
+        args.max_turn_seconds,
+        args.max_turn_cost_usd,
+        args.input_cost_per_million_tokens,
+        args.output_cost_per_million_tokens,
+        args.model_max_retries,
+        args.model_retry_base_delay_seconds,
+    )
+    # 非默认阶段五限制属于能力集合的一部分，编码进 preset ID，避免恢复时静默换预算。
+    if phase5_values != (4, None, None, None, None, None, 2, 0.5):
+        preset_id += ":p5=" + ",".join(
+            "none" if value is None else str(value) for value in phase5_values
+        )
     config = AgentPreset(
         id=preset_id,
         provider=args.provider,
         model=model,
         max_steps=args.max_steps,
+        max_parallel_tools=args.max_parallel_tools,
+        max_turn_tokens=args.max_turn_tokens,
+        max_turn_seconds=args.max_turn_seconds,
+        max_turn_cost_usd=args.max_turn_cost_usd,
+        input_cost_per_million_tokens=args.input_cost_per_million_tokens,
+        output_cost_per_million_tokens=args.output_cost_per_million_tokens,
+        model_max_retries=args.model_max_retries,
+        model_retry_base_delay_seconds=args.model_retry_base_delay_seconds,
         workspace=workspace,
         permission_mode=args.permission_mode,
     )
@@ -453,9 +522,11 @@ async def _dispatch_chat_line(agent: Agent, raw_line: str) -> bool:
             f"next_step：{len(agent.inbox.pending('next_step'))} 条",
         ]
         if request is not None:
+            attempt_text = f"，尝试 {request.attempt}" if request.attempt > 1 else ""
             details.append(
                 f"模型请求：Turn {request.turn} / Step {request.step} → "
-                f"{request.provider}/{request.model}，已等待 {request.elapsed_seconds:.1f} 秒"
+                f"{request.provider}/{request.model}{attempt_text}，"
+                f"已等待 {request.elapsed_seconds:.1f} 秒"
             )
         elif agent.status == "running":
             details.append("模型请求：当前无活动请求，可能正在执行工具或切换 Step")

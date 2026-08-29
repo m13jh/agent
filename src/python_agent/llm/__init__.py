@@ -5,15 +5,25 @@
 
 from python_agent.llm.adapter import ModelAdapter, StreamingModelAdapter
 from python_agent.llm.fake_adapter import FakeAdapter
+from python_agent.llm.retry import (
+    DefaultModelRetryPolicy,
+    ModelRetryContext,
+    ModelRetryPolicy,
+    RetryDecision,
+)
 from python_agent.llm.types import AssistantResponse, ModelChunk, ModelRequest, ToolCall, Usage
 
 __all__ = [
     "AssistantResponse",
     "FakeAdapter",
+    "DefaultModelRetryPolicy",
     "ModelAdapter",
     "ModelChunk",
     "ModelRequest",
+    "ModelRetryContext",
+    "ModelRetryPolicy",
     "StreamingModelAdapter",
+    "RetryDecision",
     "ToolCall",
     "Usage",
 ]

@@ -12,6 +12,7 @@ from python_agent.errors import ConfigurationError
 from python_agent.hooks.event_bus import LiveEventBus
 from python_agent.ids import SessionId, new_session_id
 from python_agent.llm.adapter import ModelAdapter, ModelRouter
+from python_agent.llm.retry import ModelRetryPolicy
 from python_agent.session.events import SessionHeader
 from python_agent.session.session import Session
 from python_agent.session.store import SessionStore
@@ -63,6 +64,7 @@ class AgentManager:
         pre_policies: tuple[PreHandler, ...] = (),
         execute_policies: tuple[ExecuteHandler, ...] = (),
         post_policies: tuple[PostHandler, ...] = (),
+        request_retry_policy: ModelRetryPolicy | None = None,
     ) -> Agent:
         """创建 Agent、登记所有权并发布 agent/created 通知。
 
@@ -94,6 +96,7 @@ class AgentManager:
             pre_policies=pre_policies,
             execute_policies=execute_policies,
             post_policies=post_policies,
+            request_retry_policy=request_retry_policy,
         )
         await self._register_agent(agent)
         return agent
@@ -129,6 +132,7 @@ class AgentManager:
         pre_policies: tuple[PreHandler, ...] = (),
         execute_policies: tuple[ExecuteHandler, ...] = (),
         post_policies: tuple[PostHandler, ...] = (),
+        request_retry_policy: ModelRetryPolicy | None = None,
     ) -> Agent:
         """create 的语义别名，方便调用方使用更明确的动词名称。"""
 
@@ -145,6 +149,7 @@ class AgentManager:
             pre_policies=pre_policies,
             execute_policies=execute_policies,
             post_policies=post_policies,
+            request_retry_policy=request_retry_policy,
         )
 
     def _resolve_resume_config(
@@ -187,6 +192,7 @@ class AgentManager:
         pre_policies: tuple[PreHandler, ...] = (),
         execute_policies: tuple[ExecuteHandler, ...] = (),
         post_policies: tuple[PostHandler, ...] = (),
+        request_retry_policy: ModelRetryPolicy | None = None,
     ) -> Agent:
         """加载持久 Session、重放 Inbox，并恢复仍可唤醒的 Driver。
 
@@ -214,6 +220,7 @@ class AgentManager:
             pre_policies=pre_policies,
             execute_policies=execute_policies,
             post_policies=post_policies,
+            request_retry_policy=request_retry_policy,
             recover_orphaned_claims=True,
         )
         await self._register_agent(agent)

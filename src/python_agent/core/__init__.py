@@ -5,6 +5,7 @@ from python_agent.core.agent_loop import AgentLoop, ModelRequestStatus, RunResul
 from python_agent.core.agent_manager import AgentManager
 from python_agent.core.inbox import Inbox, UserMessage
 from python_agent.core.lifecycle import CancelCause
+from python_agent.core.limits import BudgetViolation, TurnBudget, TurnBudgetSnapshot
 
 __all__ = [
     "Agent",
@@ -13,7 +14,10 @@ __all__ = [
     "AgentManager",
     "ModelRequestStatus",
     "CancelCause",
+    "BudgetViolation",
     "Inbox",
     "RunResult",
+    "TurnBudget",
+    "TurnBudgetSnapshot",
     "UserMessage",
 ]
