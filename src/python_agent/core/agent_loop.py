@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +51,17 @@ class RunResult:
         """返回字符串形式的 Session ID，方便 CLI、日志和 JSON 序列化。"""
 
         return str(self.session.id)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRequestStatus:
+    """当前正在等待的模型请求快照，供 CLI `/status` 实时展示。"""
+
+    turn: int
+    step: int
+    provider: str
+    model: str
+    elapsed_seconds: float
 
 
 class AgentLoop:
@@ -106,6 +118,24 @@ class AgentLoop:
             post_policies=post_policies,
         )
         self.event_handler = event_handler
+        # 只保存当前正在 await 的一次模型请求；单 Driver 规则保证同一 Agent 不会同时
+        # 出现两个活动请求。开始时间使用 monotonic clock，不受系统时间校准影响。
+        self._active_request: tuple[int, int, str, str, float] | None = None
+
+    @property
+    def active_request(self) -> ModelRequestStatus | None:
+        """返回当前模型请求及已经等待的秒数；没有请求时返回 None。"""
+
+        if self._active_request is None:
+            return None
+        turn, step, provider, model, started_at = self._active_request
+        return ModelRequestStatus(
+            turn=turn,
+            step=step,
+            provider=provider,
+            model=model,
+            elapsed_seconds=max(0.0, time.monotonic() - started_at),
+        )
 
     def cancel(self) -> None:
         """请求协作式取消当前正在进行的模型或工具操作。
@@ -230,6 +260,77 @@ class AgentLoop:
         )
         return response, True
 
+    async def _request_with_status(
+        self,
+        adapter: ModelAdapter,
+        request: ModelRequest,
+        *,
+        turn: int,
+        step: int,
+    ) -> tuple[AssistantResponse, bool]:
+        """包装模型请求，发布开始/结束通知并维护可查询的实时状态。
+
+        这些通知属于 UI/指标事实，不写进模型上下文；持久化的 ``request/header`` 仍由
+        run_turn 在调用本方法前追加。无论请求完成、报错还是被取消，finally 都会清理
+        active_request，避免 `/status` 在请求结束后继续显示过期状态。
+        """
+
+        started_at = time.monotonic()
+        self._active_request = (
+            turn,
+            step,
+            request.provider,
+            request.model,
+            started_at,
+        )
+        status = "completed"
+        finish_reason: str | None = None
+        error_type: str | None = None
+        try:
+            await self._emit(
+                "model/request_start",
+                {
+                    "turn": turn,
+                    "step": step,
+                    "provider": request.provider,
+                    "model": request.model,
+                    "message_count": len(request.messages),
+                    "tool_count": len(request.tools),
+                },
+            )
+            response, streamed = await self._complete_response(
+                adapter,
+                request,
+                turn=turn,
+                step=step,
+            )
+            finish_reason = response.finish_reason
+            return response, streamed
+        except asyncio.CancelledError:
+            status = "cancelled"
+            error_type = "CancelledError"
+            raise
+        except Exception as exc:
+            status = "error"
+            error_type = type(exc).__name__
+            raise
+        finally:
+            duration_ms = max(0, round((time.monotonic() - started_at) * 1000))
+            self._active_request = None
+            await self._emit(
+                "model/request_end",
+                {
+                    "turn": turn,
+                    "step": step,
+                    "provider": request.provider,
+                    "model": request.model,
+                    "status": status,
+                    "finish_reason": finish_reason,
+                    "error_type": error_type,
+                    "duration_ms": duration_ms,
+                },
+            )
+
     async def run(self, prompt: str) -> RunResult:
         """执行一个没有外部 Inbox 的独立 Turn，保持阶段 1 的兼容 API。"""
 
@@ -237,7 +338,7 @@ class AgentLoop:
 
     async def run_turn(
         self,
-        prompt: str,
+        prompt: str | UserMessage,
         *,
         step_input_provider: StepInputProvider | None = None,
     ) -> RunResult:
@@ -248,8 +349,16 @@ class AgentLoop:
         调用，工具结果就会进入下一次 ModelRequest 的消息投影。
         """
 
-        if not isinstance(prompt, str) or not prompt.strip():
+        prompt_content = prompt.content if isinstance(prompt, UserMessage) else prompt
+        if not isinstance(prompt_content, str) or not prompt_content.strip():
             raise ValueError("prompt must be a non-empty string")
+        # Agent Handle 传入完整 UserMessage 时必须沿用 Inbox MessageId。这样进程重启后可以
+        # 区分“claim 已正式写入模型历史”和“刚出队就崩溃”两种状态；阶段 1 直接传字符串
+        # 时仍在这里生成新 ID，保持原有 API 兼容。
+        prompt_message_id = (
+            prompt.message_id if isinstance(prompt, UserMessage) else new_message_id()
+        )
+        prompt_kind = prompt.kind if isinstance(prompt, UserMessage) else "followup"
 
         turn = self.session.next_turn()
         self.session.append("turn/start", {"turn": turn})
@@ -272,7 +381,11 @@ class AgentLoop:
                     if prompt_pending:
                         self.session.append(
                             "user/message",
-                            {"message_id": str(new_message_id()), "content": prompt},
+                            {
+                                "message_id": str(prompt_message_id),
+                                "content": prompt_content,
+                                "input_kind": prompt_kind,
+                            },
                         )
                         prompt_pending = False
                     # 4. 从 Session 事件投影消息，并组装本次请求和工具 Schema。
@@ -303,7 +416,7 @@ class AgentLoop:
                         },
                     )
                     # 5. 发起模型请求：优先使用流式 stream()，否则回退到 complete()。
-                    response, streamed = await self._complete_response(
+                    response, streamed = await self._request_with_status(
                         adapter,
                         request,
                         turn=turn,

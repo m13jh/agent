@@ -13,6 +13,22 @@ class SessionError(AgentError):
     """Session 事件日志违反格式或顺序约束。"""
 
 
+class SessionNotFoundError(SessionError):
+    """请求加载的 Session 在持久化存储中不存在。"""
+
+
+class SessionConflictError(SessionError):
+    """创建 Session 时目标 ID 已存在，拒绝覆盖已有事件历史。"""
+
+
+class SessionFormatError(SessionError):
+    """Header、JSONL 或事件版本不兼容，无法进行确定性回放。"""
+
+
+class SessionRepairRequired(SessionFormatError):
+    """日志尾部可安全修复，但调用方尚未显式授权修复操作。"""
+
+
 class ProjectionError(SessionError):
     """事件无法安全投影为模型可见消息。"""
 

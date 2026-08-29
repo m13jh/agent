@@ -1,8 +1,8 @@
 # python-agent
 
-`python-agent` 是一个小而清晰的原生 Python Agent Harness。当前版本完成架构文档中的
-“阶段 0 + 阶段 1”：它提供内存事件日志、模型适配器、串行工具运行时，以及一个可运行的
-“模型 → 工具 → 模型”闭环。
+`python-agent` 是一个小而清晰的原生 Python Agent Harness。当前版本已完成架构文档中的
+阶段 0—4：除“模型 → 工具 → 模型”闭环、Agent Handle 和安全工具流水线外，还提供
+JSONL Session 持久化、崩溃恢复、Inbox 重放和 transcript 导出。
 
 ## 安装
 
@@ -159,6 +159,78 @@ python-agent chat
 
 模型在后台运行时仍然可以输入下一条 followup 或 steer；实时输出由 Live Event Bus
 转发到终端。
+
+终端显示的 `你>` 是提示符，不需要手动输入。若从示例中误粘贴了一个或多个 `你>`，
+chat 会自动移除并显示 `[输入修正]`，因此 `你> /transcript` 仍会按本地命令执行。
+
+提交消息后会看到明确反馈：idle 时显示 `[已提交]`；已有任务运行时显示 `[已排队]` 和
+当前队列长度。每次真实模型请求会显示 Provider/模型、开始状态、完成/失败/取消状态和
+耗时。运行期间输入 `/status` 还能查看当前 Turn/Step 与已等待秒数，例如：
+
+```text
+状态：running
+next_turn：1 条
+next_step：0 条
+模型请求：Turn 2 / Step 2 → deepseek/qwen3.7-flash，已等待 12.4 秒
+```
+
+如果误提交的请求仍在运行，使用 `/cancel` 清空当前执行和排队输入，再重新输入；后续
+普通消息不会丢失，但在单 Driver 规则下只会于当前任务结束后按 FIFO 顺序执行。
+
+## 阶段 4 持久化与恢复
+
+CLI 默认把每次 Session 保存到当前 workspace 的 `.python-agent/sessions/<session-id>/`：
+
+```text
+header.json
+events.jsonl
+```
+
+每条事件会先写入 JSONL、flush 并 fsync，成功后才进入内存事件列表。一次性运行结束时
+会在 stderr 显示 Session ID；交互模式启动时也会显示。使用相同 Provider、模型、权限和
+步数配置继续会话：
+
+```bash
+python-agent run "继续检查剩余文件" --resume SESSION_ID
+python-agent chat --resume SESSION_ID
+```
+
+查看 Session、导出 transcript：
+
+```bash
+python-agent sessions
+python-agent transcript SESSION_ID transcript.txt
+```
+
+恢复默认严格校验 Header/Event 版本、连续 seq、JSONL 完整性、未知必需事件以及
+Turn/Step/工具结果配对。进程崩溃可能留下最后一行或未闭合工具调用，此时普通 load 会
+明确失败；确认目标 Session 后可显式修复：
+
+```bash
+python-agent repair SESSION_ID
+python-agent chat --resume SESSION_ID --repair-session
+```
+
+物理截断前会创建 `events.jsonl.repair-backup*`。恢复不会自动重放状态不明的工具，而是
+追加一个错误 `tool/result` 并关闭原 Step/Turn，避免写操作产生重复副作用。
+
+Python API 可以把 Store 交给 Manager：
+
+```python
+from pathlib import Path
+
+from python_agent import AgentManager, AgentPreset, FakeAdapter, JsonlSessionStore
+
+store = JsonlSessionStore(Path(".python-agent"))
+config = AgentPreset(id="coding-v1", workspace=Path.cwd())
+manager = AgentManager(session_store=store, presets={config.id: config})
+
+agent = await manager.create(FakeAdapter(), config=config)
+session_id = agent.id
+
+# 进程重启后：重放 Inbox；存在可唤醒消息时自动恢复单 Driver。
+agent = await manager.resume(session_id, FakeAdapter())
+```
 
 ## 待改进清单
 

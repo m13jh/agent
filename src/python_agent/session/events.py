@@ -11,6 +11,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from python_agent.ids import SessionId
 
+# Header 与 Event 分别保留版本号。当前二者都从 1 开始，但使用两个常量而不是共用一个，
+# 是为了允许未来只升级事件编码、而不必同时改变 Header 目录元数据格式。
+SESSION_HEADER_VERSION = 1
+SESSION_EVENT_VERSION = 1
+
 
 def utc_now() -> datetime:
     """生成带 UTC 时区信息的当前时间，保证跨机器回放时不会混淆本地时区。"""
@@ -23,7 +28,11 @@ class SessionHeader(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    version: int = Field(default=1, gt=0, description="Session Header 格式版本")
+    version: int = Field(
+        default=SESSION_HEADER_VERSION,
+        gt=0,
+        description="Session Header 格式版本；兼容性由 SessionStore 在加载边界校验",
+    )
     id: SessionId = Field(description="Session 和 Agent 共用的稳定 ID")
     created_at: datetime = Field(default_factory=utc_now, description="创建时间，使用 UTC")
     cwd: Path | None = Field(default=None, description="本次 Agent 可见的工作目录")
@@ -41,6 +50,11 @@ class SessionEvent(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    version: int = Field(
+        default=SESSION_EVENT_VERSION,
+        gt=0,
+        description="单条事件的编码版本；旧日志缺省时按版本 1 读取",
+    )
     seq: int = Field(ge=0, description="Session 内从 0 开始连续递增的事件序号")
     time: datetime = Field(default_factory=utc_now, description="事件追加时间，使用 UTC")
     type: str = Field(min_length=1, description="事件类型，例如 user/message 或 tool/result")
@@ -57,7 +71,9 @@ class SessionEvent(BaseModel):
         """在事件进入日志前拒绝 Path、对象实例等不可回放的值。"""
 
         try:
-            json.dumps(value, ensure_ascii=False)
+            # allow_nan=False 很重要：NaN/Infinity 虽然能被 Python 的宽松 JSON 编码器
+            # 输出，却不是标准 JSON。若允许它们落盘，其他语言或严格解析器就无法回放。
+            json.dumps(value, ensure_ascii=False, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("session event data must be JSON serializable") from exc
         return value

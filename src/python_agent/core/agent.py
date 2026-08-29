@@ -8,7 +8,7 @@ from typing import Any
 
 from python_agent.approval.service import ApprovalService
 from python_agent.config import AgentPreset
-from python_agent.core.agent_loop import AgentLoop, RunResult
+from python_agent.core.agent_loop import AgentLoop, ModelRequestStatus, RunResult
 from python_agent.core.inbox import Inbox, UserMessage
 from python_agent.core.lifecycle import AgentStatus, CancelCause
 from python_agent.hooks.event_bus import LiveEventBus
@@ -44,6 +44,7 @@ class Agent:
         pre_policies: tuple[PreHandler, ...] = (),
         execute_policies: tuple[ExecuteHandler, ...] = (),
         post_policies: tuple[PostHandler, ...] = (),
+        recover_orphaned_claims: bool = False,
     ) -> None:
         """创建一个长期存活的 Handle，并把所有 Driver 相关资源绑定到本实例。
 
@@ -58,7 +59,11 @@ class Agent:
             cwd=workspace or self.config.workspace,
         )
         self.session.set_event_listener(self._on_session_event)
-        self.inbox = Inbox(self.session, replay=session is not None)
+        self.inbox = Inbox(
+            self.session,
+            replay=session is not None,
+            recover_orphaned_claims=recover_orphaned_claims,
+        )
         self.loop = AgentLoop(
             adapter,
             tools,
@@ -101,6 +106,12 @@ class Agent:
 
         return self._last_result
 
+    @property
+    def active_request(self) -> ModelRequestStatus | None:
+        """返回当前模型请求和实时等待时长，供 CLI 状态面板查询。"""
+
+        return self.loop.active_request
+
     async def run(self, prompt: str) -> RunResult:
         """兼容阶段 1 的单次 API：提交 followup 并等待 Agent 重新 idle。"""
 
@@ -131,6 +142,16 @@ class Agent:
 
         self._ensure_not_disposed()
         return self.inbox.append(message, "inject")
+
+    async def resume_pending(self) -> None:
+        """恢复进程重启前仍在 Inbox 中的可唤醒工作。
+
+        方法不会插入新消息，只复用单 Driver 的创建规则。仅有 inject 时继续保持 idle；
+        存在 followup 或 steer 时才启动 Driver，避免恢复动作本身改变三种输入语义。
+        """
+
+        self._ensure_not_disposed()
+        await self._ensure_driver()
 
     async def cancel(self, cause: CancelCause, *, keep_inbox: bool = False) -> None:
         """请求取消当前 Driver，并等待它和当前模型/工具调用收敛。
@@ -216,7 +237,9 @@ class Agent:
                     break
                 self.loop.reset_cancel()
                 self._last_result = await self.loop.run_turn(
-                    wake_message.content,
+                    # 传入完整消息而不是只有 content，确保 user/message 沿用 Inbox MessageId；
+                    # 该关联是阶段四判断孤立 claim、避免崩溃丢任务的依据。
+                    wake_message,
                     step_input_provider=self.inbox.claim_next_step,
                 )
         except asyncio.CancelledError:

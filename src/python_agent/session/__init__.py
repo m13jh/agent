@@ -4,7 +4,17 @@ Session 模块只负责记录和投影，不负责调用模型或执行工具，
 """
 
 from python_agent.session.events import SessionEvent, SessionHeader
+from python_agent.session.jsonl_store import JsonlSessionStore, SessionRepairReport
 from python_agent.session.projection import derive_messages
 from python_agent.session.session import Session
+from python_agent.session.store import SessionStore
 
-__all__ = ["Session", "SessionEvent", "SessionHeader", "derive_messages"]
+__all__ = [
+    "JsonlSessionStore",
+    "Session",
+    "SessionEvent",
+    "SessionHeader",
+    "SessionRepairReport",
+    "SessionStore",
+    "derive_messages",
+]

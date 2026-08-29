@@ -2,8 +2,8 @@
 
 Inbox 本身只负责消息排队和操作记录，不负责启动 Agent。每一次插入、领取、替换和删除
 都会追加 ``agent/inbox/spliced`` 事件；恢复时重放这些事件即可得到和崩溃前一致的待处理
-消息集合。这里的 durable 指事件语义可恢复，磁盘 JSONL 落盘由后续阶段的 SessionStore
-负责。
+消息集合。阶段四中，Session 若由 JsonlSessionStore 创建，这些 splice 事件会先落盘；
+恢复时还会识别“已 claim 但尚未写入 user/message”的崩溃窗口，避免任务永久丢失。
 """
 
 from __future__ import annotations
@@ -51,14 +51,28 @@ class Inbox:
     ``user/message`` Session 事件；因此 Inbox 只表示尚未消费的工作。
     """
 
-    def __init__(self, session: Session, *, replay: bool = False) -> None:
-        """绑定一个 Session；replay=True 时从已有 spliced 事件恢复未消费消息。"""
+    def __init__(
+        self,
+        session: Session,
+        *,
+        replay: bool = False,
+        recover_orphaned_claims: bool = False,
+    ) -> None:
+        """绑定一个 Session，并可从已有 spliced 事件恢复未消费消息。
+
+        ``recover_orphaned_claims`` 只应在进程重启恢复时打开：若日志中存在 claim、却没有
+        同 MessageId 的 ``user/message``，说明进程可能恰好在“出队后、写入模型历史前”
+        崩溃，此时把消息放回队首可以避免任务丢失。普通内存 replay 仍严格重现队列操作。
+        """
 
         self.session = session
         self._next_turn: deque[UserMessage] = deque()
         self._next_step: deque[UserMessage] = deque()
         if replay:
-            self.replay(session.events)
+            self.replay(
+                session.events,
+                recover_orphaned_claims=recover_orphaned_claims,
+            )
 
     @property
     def has_next_turn(self) -> bool:
@@ -172,10 +186,26 @@ class Inbox:
                 item = queue.popleft()
                 self._record("delete", queue_name, item)
 
-    def replay(self, events: Iterable[SessionEvent]) -> None:
-        """从 agent/inbox/spliced 事件重建队列，不重新写入事件。"""
+    def replay(
+        self,
+        events: Iterable[SessionEvent],
+        *,
+        recover_orphaned_claims: bool = False,
+    ) -> None:
+        """从 Inbox 事件重建队列，不在恢复过程中追加新事件。
 
+        开启孤立 claim 恢复时会同时观察 ``user/message.message_id``：只有已正式进入
+        Session 模型历史的消息才算消费完成。未完成的 claim 按原 claim 顺序放回对应队首，
+        因而比崩溃期间后来插入的消息更早执行。
+        """
+
+        claimed: dict[MessageId, tuple[int, InboxQueue, UserMessage]] = {}
         for event in events:
+            if event.type == "user/message" and recover_orphaned_claims:
+                raw_message_id = event.data.get("message_id")
+                if isinstance(raw_message_id, str):
+                    claimed.pop(MessageId(raw_message_id), None)
+                continue
             if event.type != "agent/inbox/spliced":
                 continue
             data = event.data
@@ -188,8 +218,23 @@ class Inbox:
             if operation == "insert" or operation == "replace":
                 self._remove_without_record(item.message_id)
                 self._queue(queue_name).append(item)
-            elif operation == "claim" or operation == "delete":
+                claimed.pop(item.message_id, None)
+            elif operation == "claim":
                 self._remove_without_record(item.message_id)
+                if recover_orphaned_claims:
+                    claimed[item.message_id] = (event.seq, queue_name, item)
+            elif operation == "delete":
+                self._remove_without_record(item.message_id)
+                claimed.pop(item.message_id, None)
+
+        if recover_orphaned_claims:
+            # appendleft 会反转插入顺序，所以按 claim seq 倒序处理，最终队列仍保持原 FIFO。
+            for _, queue_name, item in sorted(
+                claimed.values(),
+                key=lambda entry: entry[0],
+                reverse=True,
+            ):
+                self._queue(queue_name).appendleft(item)
 
     def _queue(self, queue_name: InboxQueue) -> deque[UserMessage]:
         """把公开队列名称映射到对应的内部 deque。"""

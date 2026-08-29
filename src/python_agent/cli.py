@@ -1,4 +1,4 @@
-"""阶段 1—3 Agent 的命令行入口。
+"""阶段 1—4 Agent 的命令行入口。
 
 ``run`` 负责一次性任务，``chat`` 负责长期交互。两者共享同一套 AgentManager、工具
 注册表、权限配置和 Live Event Bus，因此命令行只是接入层，不重复实现 Agent 逻辑。
@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -25,11 +26,12 @@ from python_agent.core.agent import Agent
 from python_agent.core.agent_manager import AgentManager
 from python_agent.core.lifecycle import CancelCause
 from python_agent.hooks.event_bus import LiveEventBus
-from python_agent.ids import CallId
+from python_agent.ids import CallId, SessionId
 from python_agent.llm.adapter import ModelAdapter
 from python_agent.llm.deepseek_adapter import DeepSeekAdapter
 from python_agent.llm.fake_adapter import FakeAdapter, ResponseFactory
 from python_agent.llm.types import AssistantResponse, ModelRequest, ToolCall
+from python_agent.session.jsonl_store import JsonlSessionStore
 from python_agent.tools.builtins import (
     ApplyPatchTool,
     BashTool,
@@ -50,6 +52,32 @@ def _display_event(event_type: str, data: dict[str, Any]) -> None:
     只展示有限长度，完整结果仍然保存在 Session 的 ``tool/result`` 事件中。
     """
 
+    if event_type == "model/request_start":
+        print(
+            f"\n[模型请求] Turn {data.get('turn')} / Step {data.get('step')} → "
+            f"{data.get('provider')}/{data.get('model')}，正在等待响应……",
+            flush=True,
+        )
+        return
+    if event_type == "model/request_end":
+        raw_duration = data.get("duration_ms", 0)
+        duration_ms = raw_duration if isinstance(raw_duration, int | float) else 0
+        status = data.get("status")
+        if status == "completed":
+            print(
+                f"\n[模型完成] 用时 {duration_ms / 1000:.2f} 秒，"
+                f"结束原因：{data.get('finish_reason')}",
+                flush=True,
+            )
+        elif status == "cancelled":
+            print(f"\n[模型取消] 已等待 {duration_ms / 1000:.2f} 秒。", flush=True)
+        else:
+            print(
+                f"\n[模型失败] 用时 {duration_ms / 1000:.2f} 秒，"
+                f"错误类型：{data.get('error_type')}",
+                flush=True,
+            )
+        return
     if event_type == "assistant/delta":
         content = data.get("content")
         if isinstance(content, str):
@@ -122,6 +150,22 @@ def _add_agent_options(command: argparse.ArgumentParser) -> None:
     command.add_argument("--workspace", type=Path, default=Path.cwd())
     command.add_argument("--max-steps", type=int, default=30)
     command.add_argument(
+        "--session-root",
+        type=Path,
+        default=None,
+        help="Session storage root; defaults to WORKSPACE/.python-agent",
+    )
+    command.add_argument(
+        "--resume",
+        metavar="SESSION_ID",
+        help="resume a persisted Session before submitting new input",
+    )
+    command.add_argument(
+        "--repair-session",
+        action="store_true",
+        help="repair a provably incomplete crash tail while resuming",
+    )
+    command.add_argument(
         "--permission-mode",
         choices=("read-only", "workspace-write"),
         default="read-only",
@@ -150,7 +194,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     chat = subparsers.add_parser("chat", help="start an interactive agent session")
     _add_agent_options(chat)
+
+    sessions = subparsers.add_parser("sessions", help="list persisted Sessions")
+    sessions.add_argument("--session-root", type=Path, default=Path(".python-agent"))
+
+    transcript = subparsers.add_parser("transcript", help="export a Session transcript")
+    transcript.add_argument("session_id")
+    transcript.add_argument("output", type=Path)
+    transcript.add_argument("--session-root", type=Path, default=Path(".python-agent"))
+
+    repair = subparsers.add_parser("repair", help="repair a recoverable Session crash tail")
+    repair.add_argument("session_id")
+    repair.add_argument("--session-root", type=Path, default=Path(".python-agent"))
     return parser
+
+
+def _session_root(value: Path | None, workspace: Path) -> Path:
+    """把相对 Session 根解释为 workspace 内路径，并返回规范化绝对路径。"""
+
+    if value is None:
+        return (workspace / ".python-agent").resolve()
+    return value.expanduser().resolve() if value.is_absolute() else (workspace / value).resolve()
 
 
 async def _create_agent(args: argparse.Namespace) -> tuple[AgentManager, Agent]:
@@ -177,23 +241,41 @@ async def _create_agent(args: argparse.Namespace) -> tuple[AgentManager, Agent]:
         demo_read = getattr(args, "demo_read", None)
         adapter = FakeAdapter(_demo_responder(demo_read) if demo_read else None)
         model = args.model or "fake-model"
+    workspace = args.workspace.resolve()
+    # CLI 没有独立的 preset 配置文件，因此把影响恢复能力的关键选项编码进稳定 ID。
+    # 用户若用不同 Provider、模型、权限或步数恢复，Manager 会因 ID 不匹配而明确拒绝。
+    preset_id = f"cli-v1:{args.provider}:{model}:{args.permission_mode}:steps={args.max_steps}"
     config = AgentPreset(
+        id=preset_id,
         provider=args.provider,
         model=model,
         max_steps=args.max_steps,
-        workspace=args.workspace.resolve(),
+        workspace=workspace,
         permission_mode=args.permission_mode,
     )
     approval_service = CallbackApprovalService(_allow_explicit_bash) if args.approve_bash else None
     event_bus = LiveEventBus()
     event_bus.subscribe("*", _display_event)
-    manager = AgentManager(event_bus=event_bus)
-    agent = await manager.create(
-        adapter,
-        registry,
-        config=config,
-        approval_service=approval_service,
-    )
+    store = JsonlSessionStore(_session_root(args.session_root, workspace))
+    manager = AgentManager(event_bus=event_bus, session_store=store)
+    if args.resume:
+        agent = await manager.resume(
+            SessionId(args.resume),
+            adapter,
+            registry,
+            config=config,
+            repair=args.repair_session,
+            approval_service=approval_service,
+        )
+    else:
+        if args.repair_session:
+            raise ValueError("--repair-session requires --resume SESSION_ID")
+        agent = await manager.create(
+            adapter,
+            registry,
+            config=config,
+            approval_service=approval_service,
+        )
     return manager, agent
 
 
@@ -209,6 +291,8 @@ async def _run(args: argparse.Namespace) -> int:
             raise RuntimeError("agent became idle without a result")
         # 流式内容在事件回调中已经输出，这里只补一个换行，避免 Shell 提示符紧贴答案。
         print()
+        # Session ID 写到 stderr，不混入模型最终回答的 stdout；调用方仍可复制它用于恢复。
+        print(f"[Session] {result.session_id}", file=sys.stderr)
         if args.show_events:
             # 事件输出是诊断视图，不参与模型上下文，也不会改变已完成的 Session。
             print("\n--- session events ---")
@@ -216,6 +300,56 @@ async def _run(args: argparse.Namespace) -> int:
                 print(event.model_dump_json())
     finally:
         await manager.shutdown()
+    return 0
+
+
+async def _list_persisted_sessions(args: argparse.Namespace) -> int:
+    """列出 Store 中的 Header，不加载模型或创建 Agent。"""
+
+    store = JsonlSessionStore(args.session_root.expanduser().resolve())
+    headers = await store.list()
+    if not headers:
+        print("（没有持久化 Session）")
+        return 0
+    for header in headers:
+        print(
+            f"{header.id}\t{header.created_at.isoformat()}\t"
+            f"preset={header.agent_preset or '-'}\tcwd={header.cwd or '-'}"
+        )
+    return 0
+
+
+async def _export_persisted_transcript(args: argparse.Namespace) -> int:
+    """从严格校验后的事件日志导出 transcript。"""
+
+    store = JsonlSessionStore(args.session_root.expanduser().resolve())
+    output = await store.export_transcript(SessionId(args.session_id), args.output)
+    print(output)
+    return 0
+
+
+async def _repair_persisted_session(args: argparse.Namespace) -> int:
+    """显式执行保守修复，并输出便于审计的结构化报告。"""
+
+    store = JsonlSessionStore(args.session_root.expanduser().resolve())
+    report = await store.repair(SessionId(args.session_id))
+    print(
+        json.dumps(
+            {
+                "changed": report.changed,
+                "tail_action": report.tail.action,
+                "backup_path": (
+                    str(report.tail.backup_path) if report.tail.backup_path is not None else None
+                ),
+                "recovered_call_ids": list(report.semantic.recovered_call_ids),
+                "closed_step": report.semantic.closed_step,
+                "closed_turn": report.semantic.closed_turn,
+                "appended_event_seqs": list(report.semantic.appended_event_seqs),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -233,8 +367,123 @@ def _print_chat_help() -> None:
   /wait             等待当前任务回到 idle
   /exit             退出交互模式
 直接输入其他文本会调用 followup，开启一个新的 Turn。
+“你>”是终端提示符，无需手动输入；误粘贴时会自动移除。
+Agent 运行中的 followup 会显示“已排队”，并在当前任务结束后按顺序处理。
 """
     )
+
+
+_CHAT_PROMPT_PREFIX = re.compile(r"^(?:你>\s*)+")
+
+
+def _normalize_chat_line(raw_line: str) -> tuple[str, int]:
+    """清理从终端示例中误复制进输入框的一个或多个 ``你>`` 提示符。
+
+    ``PromptSession`` 返回的文本本来不包含提示符，但用户从文档或终端复制整行时可能把
+    它一起粘贴回来。若不处理，``你> /transcript`` 会被当成普通 followup 发送给模型。
+    返回移除数量是为了让 UI 明确告知发生了自动修正，而不是静默篡改输入。
+    """
+
+    stripped = raw_line.strip()
+    matched = _CHAT_PROMPT_PREFIX.match(stripped)
+    if matched is None:
+        return stripped, 0
+    prefix = matched.group(0)
+    return stripped[matched.end() :].strip(), prefix.count("你>")
+
+
+async def _dispatch_chat_line(agent: Agent, raw_line: str) -> bool:
+    """解析并执行一行交互输入；返回 True 表示调用方应退出 REPL。
+
+    把命令分发从 prompt 读取循环中抽离后，提示符清理、排队反馈和状态展示都可以进行
+    确定性的单元测试。普通 followup 在 Agent 已运行时只入队，因此这里必须明确打印
+    ``已排队``，避免用户因没有立即出现第二个模型回答而反复提交同一问题。
+    """
+
+    line, removed_prompts = _normalize_chat_line(raw_line)
+    if removed_prompts:
+        print(
+            f"[输入修正] 已移除 {removed_prompts} 个误复制的“你>”提示符；"
+            "以后只需输入提示符后面的内容。"
+        )
+    if not line:
+        return False
+    if line in {"/exit", "/quit"}:
+        return True
+    if line == "/help":
+        _print_chat_help()
+        return False
+    if line == "/steer":
+        print("用法：/steer 内容")
+        return False
+    if line.startswith("/steer "):
+        was_running = agent.status == "running"
+        await agent.steer(line.removeprefix("/steer ").strip())
+        pending = len(agent.inbox.pending("next_step"))
+        if was_running:
+            print(f"[已排队] steer 将在下一个 Step 生效；next_step 当前 {pending} 条。")
+        else:
+            print("[已提交] steer 已唤醒 Agent。")
+        return False
+    if line == "/inject":
+        print("用法：/inject 内容")
+        return False
+    if line.startswith("/inject "):
+        await agent.inject(line.removeprefix("/inject ").strip())
+        pending = len(agent.inbox.pending("next_step"))
+        print(f"[已注入] 静默上下文已保存；next_step 当前 {pending} 条，不会单独唤醒 Agent。")
+        return False
+    if line == "/cancel" or line == "/cancel keep":
+        keep_inbox = line == "/cancel keep"
+        await agent.cancel(
+            CancelCause(kind="user", message="交互终端取消"),
+            keep_inbox=keep_inbox,
+        )
+        if keep_inbox:
+            pending = len(agent.inbox.pending())
+            print(f"[已取消] 当前执行已停止，保留 {pending} 条 Inbox 消息。")
+        else:
+            print("[已取消] 当前执行已停止，待处理 Inbox 已清空。")
+        return False
+    if line == "/status":
+        request = agent.active_request
+        details = [
+            f"状态：{agent.status}",
+            f"next_turn：{len(agent.inbox.pending('next_turn'))} 条",
+            f"next_step：{len(agent.inbox.pending('next_step'))} 条",
+        ]
+        if request is not None:
+            details.append(
+                f"模型请求：Turn {request.turn} / Step {request.step} → "
+                f"{request.provider}/{request.model}，已等待 {request.elapsed_seconds:.1f} 秒"
+            )
+        elif agent.status == "running":
+            details.append("模型请求：当前无活动请求，可能正在执行工具或切换 Step")
+        else:
+            details.append("模型请求：无")
+        print("\n".join(details))
+        return False
+    if line == "/transcript":
+        print(agent.session.transcript() or "（当前没有 transcript）")
+        return False
+    if line == "/wait":
+        try:
+            await agent.when_idle()
+        except Exception as exc:
+            # Agent/error 已由事件总线实时展示；这里保留 REPL，并给出 wait 的收敛结果。
+            print(f"[等待结束] Agent 因 {type(exc).__name__} 结束：{exc}")
+        else:
+            print("Agent 已回到 idle。")
+        return False
+
+    was_running = agent.status == "running"
+    await agent.followup(line)
+    if was_running:
+        pending = len(agent.inbox.pending("next_turn"))
+        print(f"[已排队] followup 已保存；next_turn 当前 {pending} 条，当前任务结束后处理。")
+    else:
+        print("[已提交] followup 已唤醒 Agent。")
+    return False
 
 
 async def _chat(args: argparse.Namespace) -> int:
@@ -247,7 +496,7 @@ async def _chat(args: argparse.Namespace) -> int:
 
     manager, agent = await _create_agent(args)
     prompt_session: PromptSession[str] = PromptSession(history=InMemoryHistory())
-    print("python-agent 交互模式，输入 /help 查看命令。")
+    print(f"python-agent 交互模式，Session：{agent.id}，输入 /help 查看命令。")
     try:
         with patch_stdout():
             while True:
@@ -256,39 +505,8 @@ async def _chat(args: argparse.Namespace) -> int:
                 except (EOFError, KeyboardInterrupt):
                     print("\n正在退出……")
                     break
-                line = raw_line.strip()
-                if not line:
-                    continue
-                if line in {"/exit", "/quit"}:
+                if await _dispatch_chat_line(agent, raw_line):
                     break
-                if line == "/help":
-                    _print_chat_help()
-                elif line.startswith("/steer "):
-                    # steer 不开启新 Turn，而是在最近的 Step 边界进入下一次模型请求。
-                    await agent.steer(line.removeprefix("/steer ").strip())
-                elif line.startswith("/inject "):
-                    # inject 只入队；idle 时不会自行创建 Driver，避免静默上下文触发模型调用。
-                    await agent.inject(line.removeprefix("/inject ").strip())
-                elif line == "/cancel" or line == "/cancel keep":
-                    await agent.cancel(
-                        CancelCause(kind="user", message="交互终端取消"),
-                        keep_inbox=line == "/cancel keep",
-                    )
-                    print("已请求取消当前执行。")
-                elif line == "/status":
-                    print(
-                        f"状态：{agent.status}\n"
-                        f"next_turn：{len(agent.inbox.pending('next_turn'))} 条\n"
-                        f"next_step：{len(agent.inbox.pending('next_step'))} 条"
-                    )
-                elif line == "/transcript":
-                    print(agent.session.transcript() or "（当前没有 transcript）")
-                elif line == "/wait":
-                    await agent.when_idle()
-                    print("Agent 已回到 idle。")
-                else:
-                    # 普通文本统一视作 followup，交给 next_turn 队列；后台 Driver 会异步消费。
-                    await agent.followup(line)
     finally:
         if agent.status == "running":
             await agent.cancel(CancelCause(kind="user", message="退出交互终端"))
@@ -301,6 +519,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "sessions":
+            return asyncio.run(_list_persisted_sessions(args))
+        if args.command == "transcript":
+            return asyncio.run(_export_persisted_transcript(args))
+        if args.command == "repair":
+            return asyncio.run(_repair_persisted_session(args))
         if args.command == "chat":
             return asyncio.run(_chat(args))
         return asyncio.run(_run(args))

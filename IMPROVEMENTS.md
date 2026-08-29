@@ -12,18 +12,19 @@
 - 阶段 2：Agent Handle、AgentManager、双队列 Inbox、followup/steer/inject、单 Driver、取消和 Live Event Bus。
 - 阶段 3：Pre/Execute/Post Waterfall、权限和路径策略、审批、write_file、apply_patch、bash、输出裁剪和 spill。
 - 阶段 2扩展：python-agent chat 交互式终端和流式文本显示。
+- 阶段 4：JSONL SessionStore、严格版本/序号校验、Inbox 重放、Session resume、
+  transcript 导出，以及物理/语义崩溃尾部的保守修复。
 
 当前全量检查基线：
 
 ~~~text
 ruff：通过
 mypy：通过
-pytest：22 passed
+pytest：42 passed
 ~~~
 
 以下功能属于架构文档后续阶段，本文不把它们误记为当前缺陷：
 
-- 阶段 4：JSONL SessionStore、进程重启恢复、Session resume。
 - 阶段 5：工具并发调度、费用和 wall-time 预算、模型请求重试策略的完整版本。
 - 阶段 6：进程内子 Agent。
 - 阶段 7：上下文压缩、Session fork、Skills、SQLite、Web API/UI。
@@ -349,7 +350,7 @@ P0-5 大工具调用集成测试
     ↓
 P1-1/P1-2 上下文和工具输出治理
     ↓
-阶段 4 JSONL 持久化和恢复
+阶段 5 工具并发与运行预算
 ~~~
 
 ## 9. 待确认的产品策略

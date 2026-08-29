@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 from python_agent.approval.service import ApprovalService
 from python_agent.config import AgentPreset
 from python_agent.core.agent import Agent
+from python_agent.errors import ConfigurationError
 from python_agent.hooks.event_bus import LiveEventBus
-from python_agent.ids import SessionId
+from python_agent.ids import SessionId, new_session_id
 from python_agent.llm.adapter import ModelAdapter, ModelRouter
+from python_agent.session.events import SessionHeader
 from python_agent.session.session import Session
+from python_agent.session.store import SessionStore
 from python_agent.tools.policies import ExecuteHandler, PostHandler, PreHandler
 from python_agent.tools.registry import ToolRegistry
 
@@ -18,11 +22,31 @@ from python_agent.tools.registry import ToolRegistry
 class AgentManager:
     """管理当前进程中的 Agent，并确保每个 Handle 都有明确生命周期所有者。"""
 
-    def __init__(self, *, event_bus: LiveEventBus | None = None) -> None:
-        """创建 Manager；所有由 create 返回的 Agent 都会登记在本实例中。"""
+    def __init__(
+        self,
+        *,
+        event_bus: LiveEventBus | None = None,
+        session_store: SessionStore | None = None,
+        presets: Mapping[str, AgentPreset] | None = None,
+    ) -> None:
+        """创建 Manager，并可绑定阶段四持久化 Store 与可恢复 preset。
+
+        ``presets`` 按稳定 ID 保存完整能力配置。恢复时若调用方没有显式传入 config，
+        Manager 只能使用这里登记且与 Header 同名的 preset；找不到时默认拒绝，避免旧会话
+        在重启后悄悄获得不同模型、工具或权限。
+        """
 
         self.event_bus = event_bus or LiveEventBus()
+        self.session_store = session_store
+        self._presets: dict[str, AgentPreset] = dict(presets or {})
         self._agents: dict[SessionId, Agent] = {}
+
+    def register_preset(self, preset: AgentPreset) -> None:
+        """登记可用于恢复的不可变 preset；重复 ID 必须显式报错。"""
+
+        if preset.id in self._presets:
+            raise ConfigurationError(f"agent preset already registered: {preset.id}")
+        self._presets[preset.id] = preset
 
     async def create(
         self,
@@ -40,12 +64,26 @@ class AgentManager:
         execute_policies: tuple[ExecuteHandler, ...] = (),
         post_policies: tuple[PostHandler, ...] = (),
     ) -> Agent:
-        """创建 Agent、登记所有权并发布 agent/created 通知。"""
+        """创建 Agent、登记所有权并发布 agent/created 通知。
+
+        Manager 绑定 SessionStore 时，新 Session 会先在 Store 中原子创建，再交给 Agent；
+        因而 Agent 构造完成后的第一条 Inbox 事件就已经具备持久化能力。
+        """
+
+        resolved_config = config or AgentPreset()
+        if session is None and self.session_store is not None:
+            session = await self.session_store.create(
+                SessionHeader(
+                    id=new_session_id(),
+                    cwd=workspace or resolved_config.workspace,
+                    agent_preset=resolved_config.id,
+                )
+            )
 
         agent = Agent(
             adapter,
             tools,
-            config=config,
+            config=resolved_config,
             session=session,
             system_prompt=system_prompt,
             workspace=workspace,
@@ -57,6 +95,12 @@ class AgentManager:
             execute_policies=execute_policies,
             post_policies=post_policies,
         )
+        await self._register_agent(agent)
+        return agent
+
+    async def _register_agent(self, agent: Agent) -> None:
+        """登记唯一所有权并发布 created；失败前不会覆盖已有 Handle。"""
+
         if agent.id in self._agents:
             await agent.dispose()
             raise RuntimeError(f"agent already managed: {agent.id}")
@@ -69,7 +113,6 @@ class AgentManager:
                 "status": agent.status,
             },
         )
-        return agent
 
     async def create_agent(
         self,
@@ -103,6 +146,79 @@ class AgentManager:
             execute_policies=execute_policies,
             post_policies=post_policies,
         )
+
+    def _resolve_resume_config(
+        self,
+        session: Session,
+        explicit: AgentPreset | None,
+    ) -> AgentPreset:
+        """按 Header preset 名称恢复同一能力集合，禁止静默换配置。"""
+
+        expected = session.header.agent_preset
+        if explicit is not None:
+            if expected is not None and explicit.id != expected:
+                raise ConfigurationError(
+                    f"session {session.id} requires preset {expected!r}, "
+                    f"but {explicit.id!r} was supplied"
+                )
+            return explicit
+        if expected is None:
+            # 兼容阶段一到三创建、尚未记录 preset 的内存日志；这类日志只能使用安全默认值。
+            return AgentPreset()
+        try:
+            return self._presets[expected]
+        except KeyError as exc:
+            raise ConfigurationError(
+                f"cannot resume session {session.id}: preset {expected!r} is not registered"
+            ) from exc
+
+    async def resume(
+        self,
+        session_id: SessionId,
+        adapter: ModelAdapter | ModelRouter,
+        tools: ToolRegistry | None = None,
+        *,
+        config: AgentPreset | None = None,
+        repair: bool = False,
+        system_prompt: str | None = None,
+        approval_service: ApprovalService | None = None,
+        approval_required: set[str] | frozenset[str] | None = None,
+        spill_directory: Path | None = None,
+        pre_policies: tuple[PreHandler, ...] = (),
+        execute_policies: tuple[ExecuteHandler, ...] = (),
+        post_policies: tuple[PostHandler, ...] = (),
+    ) -> Agent:
+        """加载持久 Session、重放 Inbox，并恢复仍可唤醒的 Driver。
+
+        ``repair=False`` 是默认安全模式：物理半行、未闭合 Step 或工具调用都会明确失败。
+        调用方确认是进程崩溃尾部后可传 ``repair=True``，Store 会先追加补偿事实，再发布
+        Agent。恢复 Inbox 时也会找回“已 claim 但尚未写成 user/message”的孤立消息。
+        """
+
+        if self.session_store is None:
+            raise ConfigurationError("AgentManager.resume requires a SessionStore")
+        session = await self.session_store.load(session_id, repair=repair)
+        resolved_config = self._resolve_resume_config(session, config)
+        agent = Agent(
+            adapter,
+            tools,
+            config=resolved_config,
+            session=session,
+            system_prompt=system_prompt,
+            # workspace 必须来自持久化 Header，不能由恢复调用悄悄扩大。
+            workspace=session.header.cwd,
+            event_bus=self.event_bus,
+            approval_service=approval_service,
+            approval_required=approval_required,
+            spill_directory=spill_directory,
+            pre_policies=pre_policies,
+            execute_policies=execute_policies,
+            post_policies=post_policies,
+            recover_orphaned_claims=True,
+        )
+        await self._register_agent(agent)
+        await agent.resume_pending()
+        return agent
 
     def get(self, agent_id: SessionId) -> Agent:
         """根据稳定 ID 返回 Agent；不存在时明确失败。"""

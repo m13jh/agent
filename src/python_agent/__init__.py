@@ -4,23 +4,30 @@
 AgentManager、FakeAdapter 或 Session，而不必了解包内部的目录组织。
 """
 
+from python_agent.config import AgentPreset
 from python_agent.core.agent import Agent
-from python_agent.core.agent_loop import AgentLoop, RunResult
+from python_agent.core.agent_loop import AgentLoop, ModelRequestStatus, RunResult
 from python_agent.core.agent_manager import AgentManager
 from python_agent.core.lifecycle import CancelCause
 from python_agent.hooks.event_bus import LiveEventBus
 from python_agent.llm.fake_adapter import FakeAdapter
+from python_agent.session.jsonl_store import JsonlSessionStore
 from python_agent.session.session import Session
+from python_agent.session.store import SessionStore
 
 __all__ = [
     "Agent",
     "AgentLoop",
     "AgentManager",
+    "AgentPreset",
     "CancelCause",
     "FakeAdapter",
+    "JsonlSessionStore",
     "LiveEventBus",
+    "ModelRequestStatus",
     "RunResult",
     "Session",
+    "SessionStore",
 ]
 
 __version__ = "0.1.0"
