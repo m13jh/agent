@@ -1,9 +1,13 @@
+"""Session 序号约束和模型消息投影测试。"""
+
 from python_agent.session.events import SessionEvent, SessionHeader
 from python_agent.session.projection import derive_messages
 from python_agent.session.session import Session
 
 
 def test_session_sequences_are_contiguous() -> None:
+    """验证每次 append 都分配连续序号，并能派生 user 消息。"""
+
     session = Session.new()
     session.append("turn/start", {"turn": 1})
     session.append("user/message", {"content": "hello"})
@@ -12,6 +16,8 @@ def test_session_sequences_are_contiguous() -> None:
 
 
 def test_projection_pairs_tool_call_and_result() -> None:
+    """验证 assistant tool call 与后续 tool result 被投影成匹配消息。"""
+
     events = [
         SessionEvent(seq=0, type="user/message", data={"content": "read"}),
         SessionEvent(
@@ -40,6 +46,8 @@ def test_projection_pairs_tool_call_and_result() -> None:
 
 
 def test_projection_rejects_unknown_non_ignorable_event() -> None:
+    """验证影响上下文的未知事件不会被静默忽略。"""
+
     session = Session(SessionHeader(id="session"))
     session.append("future/context", {"value": "must not disappear"})
     try:

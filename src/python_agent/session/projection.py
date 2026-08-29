@@ -10,6 +10,12 @@ from python_agent.session.events import SessionEvent
 
 
 def _text(value: Any) -> str:
+    """把事件中的任意 JSON 值转换成模型消息需要的字符串。
+
+    字符串原样保留；字典、列表和标量使用稳定排序的 JSON 编码，确保相同日志每次
+    生成完全相同的请求内容。
+    """
+
     if isinstance(value, str):
         return value
     try:
@@ -19,6 +25,8 @@ def _text(value: Any) -> str:
 
 
 def _tool_call(call: dict[str, Any]) -> dict[str, Any]:
+    """把事件里的内部工具调用转换成 OpenAI 风格的 function call 结构。"""
+
     call_id = call.get("id", call.get("call_id"))
     name = call.get("name")
     arguments = call.get("arguments", {})
@@ -104,6 +112,7 @@ def derive_messages(events: list[SessionEvent] | tuple[SessionEvent, ...]) -> li
             "assistant/chunk",
             "agent/inbox/spliced",
             "request/header",
+            "tool/write_intent",
             "todo/write",
         }:
             continue
@@ -118,6 +127,8 @@ def derive_messages(events: list[SessionEvent] | tuple[SessionEvent, ...]) -> li
 def render_transcript(events: list[SessionEvent] | tuple[SessionEvent, ...]) -> str:
     """把持久事件渲染成紧凑、便于人工阅读和回放的文本 transcript。"""
 
+    # transcript 面向人阅读，所以保留 Turn/Step 边界和工具调用；模型上下文投影则
+    # 只保留真正具有语义的 user/assistant/tool 消息，两者故意不是同一种输出。
     lines: list[str] = []
     for event in events:
         if event.type == "user/message":

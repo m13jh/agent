@@ -23,7 +23,11 @@ InboxKind = Literal["followup", "steer", "inject"]
 
 
 class UserMessage(BaseModel):
-    """进入 Inbox 的用户消息，包含稳定的 MessageId 和输入语义。"""
+    """进入 Inbox 的用户消息，包含稳定的 MessageId 和输入语义。
+
+    kind 不会改变消息最终在模型中的 ``user`` 角色；它只决定消息如何排队、何时唤醒
+    Driver，以及在恢复时如何解释原始 Inbox 操作。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -41,9 +45,15 @@ def normalize_message(message: str | UserMessage, kind: InboxKind) -> UserMessag
 
 
 class Inbox:
-    """维护 next_turn 和 next_step 两个相互独立的 FIFO 队列。"""
+    """维护 next_turn 和 next_step 两个相互独立的 FIFO 队列。
+
+    队列内容不是模型上下文的平行副本。消息被 claim 后，AgentLoop 会把它写成正式的
+    ``user/message`` Session 事件；因此 Inbox 只表示尚未消费的工作。
+    """
 
     def __init__(self, session: Session, *, replay: bool = False) -> None:
+        """绑定一个 Session；replay=True 时从已有 spliced 事件恢复未消费消息。"""
+
         self.session = session
         self._next_turn: deque[UserMessage] = deque()
         self._next_step: deque[UserMessage] = deque()
@@ -52,14 +62,20 @@ class Inbox:
 
     @property
     def has_next_turn(self) -> bool:
+        """是否有等待开启新 Turn 的 followup。"""
+
         return bool(self._next_turn)
 
     @property
     def has_next_step(self) -> bool:
+        """是否有等待下一模型 Step 的 steer 或 inject。"""
+
         return bool(self._next_step)
 
     @property
     def has_pending(self) -> bool:
+        """是否存在任意未领取消息，包括不会主动唤醒的 inject。"""
+
         return self.has_next_turn or self.has_next_step
 
     @property
@@ -176,9 +192,13 @@ class Inbox:
                 self._remove_without_record(item.message_id)
 
     def _queue(self, queue_name: InboxQueue) -> deque[UserMessage]:
+        """把公开队列名称映射到对应的内部 deque。"""
+
         return self._next_turn if queue_name == "next_turn" else self._next_step
 
     def _claim_from(self, queue_name: InboxQueue, index: int) -> UserMessage:
+        """按索引领取消息，并记录 claim；rotate 保持 deque 的剩余顺序不变。"""
+
         queue = self._queue(queue_name)
         queue.rotate(-index)
         item = queue.popleft()
@@ -187,6 +207,8 @@ class Inbox:
         return item
 
     def _remove_without_record(self, message_id: MessageId) -> None:
+        """仅用于 replay 的内部删除，不追加新的事件，避免恢复过程污染日志。"""
+
         for queue in (self._next_turn, self._next_step):
             for index, item in enumerate(queue):
                 if item.message_id == message_id:
@@ -201,6 +223,8 @@ class Inbox:
         *,
         replaced_message_id: MessageId | None = None,
     ) -> None:
+        """把一次队列变更编码成可重放的 agent/inbox/spliced 事件。"""
+
         data: dict[str, Any] = {
             "operation": operation,
             "queue": queue_name,

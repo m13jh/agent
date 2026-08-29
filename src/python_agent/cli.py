@@ -1,4 +1,8 @@
-"""阶段 1 Agent 的命令行入口。"""
+"""阶段 1—3 Agent 的命令行入口。
+
+``run`` 负责一次性任务，``chat`` 负责长期交互。两者共享同一套 AgentManager、工具
+注册表、权限配置和 Live Event Bus，因此命令行只是接入层，不重复实现 Agent 逻辑。
+"""
 
 from __future__ import annotations
 
@@ -15,6 +19,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 
+from python_agent.approval.service import ApprovalRequest, CallbackApprovalService
 from python_agent.config import AgentPreset
 from python_agent.core.agent import Agent
 from python_agent.core.agent_manager import AgentManager
@@ -25,7 +30,15 @@ from python_agent.llm.adapter import ModelAdapter
 from python_agent.llm.deepseek_adapter import DeepSeekAdapter
 from python_agent.llm.fake_adapter import FakeAdapter, ResponseFactory
 from python_agent.llm.types import AssistantResponse, ModelRequest, ToolCall
-from python_agent.tools.builtins import EchoTool, ListFilesTool, ReadFileTool, SearchTextTool
+from python_agent.tools.builtins import (
+    ApplyPatchTool,
+    BashTool,
+    EchoTool,
+    ListFilesTool,
+    ReadFileTool,
+    SearchTextTool,
+    WriteFileTool,
+)
 from python_agent.tools.registry import ToolRegistry
 
 
@@ -65,10 +78,20 @@ def _display_event(event_type: str, data: dict[str, Any]) -> None:
         )
 
 
+def _allow_explicit_bash(_request: ApprovalRequest) -> bool:
+    """实现 --approve-bash 的明确授权；没有该开关时审批服务保持默认拒绝。"""
+
+    return True
+
+
 def _demo_responder(path: str) -> ResponseFactory:
+    """构造离线 demo 的响应工厂：第一次读文件，第二次引用工具结果回答。"""
+
     used_tool = False
 
     def respond(request: ModelRequest) -> AssistantResponse | dict[str, Any]:
+        """根据当前请求处于第几步，返回工具调用或最终回答。"""
+
         nonlocal used_tool
         if not used_tool:
             used_tool = True
@@ -98,9 +121,22 @@ def _add_agent_options(command: argparse.ArgumentParser) -> None:
     command.add_argument("--model", default=None)
     command.add_argument("--workspace", type=Path, default=Path.cwd())
     command.add_argument("--max-steps", type=int, default=30)
+    command.add_argument(
+        "--permission-mode",
+        choices=("read-only", "workspace-write"),
+        default="read-only",
+        help="whether write_file, apply_patch and bash may run",
+    )
+    command.add_argument(
+        "--approve-bash",
+        action="store_true",
+        help="explicitly approve all bash calls for this process",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """创建 CLI 参数解析器；子命令解析结果最终交给异步运行函数。"""
+
     parser = argparse.ArgumentParser(prog="python-agent", description="Run a small Python agent")
     subparsers = parser.add_subparsers(dest="command", required=True)
     run = subparsers.add_parser("run", help="run one user task")
@@ -120,11 +156,24 @@ def build_parser() -> argparse.ArgumentParser:
 async def _create_agent(args: argparse.Namespace) -> tuple[AgentManager, Agent]:
     """根据命令行参数创建 Manager、共享事件总线、工具集合和 Agent Handle。"""
 
-    registry = ToolRegistry([ReadFileTool(), ListFilesTool(), SearchTextTool(), EchoTool()])
+    # CLI 统一注册全部阶段 1—3工具；能否执行写工具或 Bash，由后续的权限和审批策略决定。
+    registry = ToolRegistry(
+        [
+            ReadFileTool(),
+            ListFilesTool(),
+            SearchTextTool(),
+            EchoTool(),
+            WriteFileTool(),
+            ApplyPatchTool(),
+            BashTool(),
+        ]
+    )
     if args.provider == "deepseek":
+        # DeepSeekAdapter 在初始化时读取 .env；model 再从命令行、环境变量或默认值解析。
         adapter: ModelAdapter = DeepSeekAdapter()
         model = args.model or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
     else:
+        # FakeAdapter 不访问网络，适合离线运行、CI 和本地验证 Agent 生命周期。
         demo_read = getattr(args, "demo_read", None)
         adapter = FakeAdapter(_demo_responder(demo_read) if demo_read else None)
         model = args.model or "fake-model"
@@ -133,15 +182,24 @@ async def _create_agent(args: argparse.Namespace) -> tuple[AgentManager, Agent]:
         model=model,
         max_steps=args.max_steps,
         workspace=args.workspace.resolve(),
+        permission_mode=args.permission_mode,
     )
+    approval_service = CallbackApprovalService(_allow_explicit_bash) if args.approve_bash else None
     event_bus = LiveEventBus()
     event_bus.subscribe("*", _display_event)
     manager = AgentManager(event_bus=event_bus)
-    agent = await manager.create(adapter, registry, config=config)
+    agent = await manager.create(
+        adapter,
+        registry,
+        config=config,
+        approval_service=approval_service,
+    )
     return manager, agent
 
 
 async def _run(args: argparse.Namespace) -> int:
+    """执行一次性任务，并在打印结果后释放 Manager 所有的 Agent 资源。"""
+
     manager, agent = await _create_agent(args)
     try:
         await agent.followup(args.prompt)
@@ -152,6 +210,7 @@ async def _run(args: argparse.Namespace) -> int:
         # 流式内容在事件回调中已经输出，这里只补一个换行，避免 Shell 提示符紧贴答案。
         print()
         if args.show_events:
+            # 事件输出是诊断视图，不参与模型上下文，也不会改变已完成的 Session。
             print("\n--- session events ---")
             for event in result.session.events:
                 print(event.model_dump_json())
@@ -205,8 +264,10 @@ async def _chat(args: argparse.Namespace) -> int:
                 if line == "/help":
                     _print_chat_help()
                 elif line.startswith("/steer "):
+                    # steer 不开启新 Turn，而是在最近的 Step 边界进入下一次模型请求。
                     await agent.steer(line.removeprefix("/steer ").strip())
                 elif line.startswith("/inject "):
+                    # inject 只入队；idle 时不会自行创建 Driver，避免静默上下文触发模型调用。
                     await agent.inject(line.removeprefix("/inject ").strip())
                 elif line == "/cancel" or line == "/cancel keep":
                     await agent.cancel(
@@ -226,6 +287,7 @@ async def _chat(args: argparse.Namespace) -> int:
                     await agent.when_idle()
                     print("Agent 已回到 idle。")
                 else:
+                    # 普通文本统一视作 followup，交给 next_turn 队列；后台 Driver 会异步消费。
                     await agent.followup(line)
     finally:
         if agent.status == "running":
@@ -235,6 +297,8 @@ async def _chat(args: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """同步 CLI 入口，负责选择子命令、启动事件循环和转换顶层异常。"""
+
     args = build_parser().parse_args(argv)
     try:
         if args.command == "chat":

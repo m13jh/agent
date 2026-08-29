@@ -12,6 +12,12 @@ from python_agent.tools.types import ToolContext
 
 
 class SearchTextTool:
+    """在 workspace 内搜索文本的只读工具。
+
+    优先使用系统的 rg 以获得更快搜索；如果 rg 不存在，则回退到 Python 遍历，保证
+    基础功能在最小环境中仍可运行。
+    """
+
     name = "search_text"
     description = "Search text files inside the workspace using ripgrep when available."
     parameters = {
@@ -27,9 +33,13 @@ class SearchTextTool:
     timeout_seconds: float | None = 20.0
 
     def is_concurrency_safe(self, arguments: dict[str, Any]) -> bool:
+        """搜索只读取文件和进程输出，不改变 workspace 状态。"""
+
         return True
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        """校验搜索路径后选择 rg 子进程或 Python 回退实现。"""
+
         query = arguments["query"]
         root = safe_path(arguments.get("path", "."), context)
         maximum = min(arguments.get("max_results", 100), 200)
@@ -44,6 +54,8 @@ class SearchTextTool:
         )
 
     async def _ripgrep(self, query: str, root: Path, workspace: Path, maximum: int) -> str:
+        """以 argv 形式执行 rg，避免通过 Shell 拼接 query 造成命令注入。"""
+
         process = await asyncio.create_subprocess_exec(
             "rg",
             "--line-number",
@@ -67,6 +79,8 @@ class SearchTextTool:
 
     @staticmethod
     def _python_search(query: str, root: Path, workspace: Path, maximum: int) -> str:
+        """没有 rg 时逐文件逐行搜索，并跳过常见的缓存和构建目录。"""
+
         del workspace
         results: list[str] = []
         for path in sorted(root.rglob("*")):

@@ -21,16 +21,27 @@ class AgentPreset(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    id: str = "default"
-    provider: str = "fake"
-    model: str = "fake-model"
-    max_steps: int = Field(default=30, gt=0)
-    max_tokens: int = Field(default=2048, gt=0)
-    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    max_tool_result_chars: int = Field(default=12000, gt=0)
-    workspace: Path | None = None
-    tools: tuple[str, ...] = ()
-    permission_mode: Literal["read-only", "workspace-write"] = "read-only"
+    id: str = Field(default="default", description="用于恢复时识别能力集合的 preset 名称")
+    provider: str = Field(default="fake", description="模型 Provider 路由名称")
+    model: str = Field(default="fake-model", description="Provider 接受的模型名称")
+    max_steps: int = Field(default=30, gt=0, description="一个 Turn 最多执行的模型步骤数")
+    max_tokens: int = Field(default=2048, gt=0, description="单次模型响应的最大输出 Token 数")
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0, description="模型采样温度")
+    max_tool_result_chars: int = Field(
+        default=12000,
+        gt=0,
+        description="工具结果进入模型上下文前允许保留的最大字符数",
+    )
+    workspace: Path | None = Field(default=None, description="工具可访问的 workspace 根目录")
+    tools: tuple[str, ...] = Field(default=(), description="允许暴露给模型的工具名称")
+    permission_mode: Literal["read-only", "workspace-write"] = Field(
+        default="read-only",
+        description="工具权限模式；写工具和 Bash 需要 workspace-write",
+    )
+    approval_required: tuple[str, ...] = Field(
+        default=("bash",),
+        description="必须经过 ApprovalService 的高风险工具名称",
+    )
 
 
 AgentConfig = AgentPreset

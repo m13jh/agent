@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from python_agent.approval.service import ApprovalService
 from python_agent.config import AgentPreset
 from python_agent.core.inbox import UserMessage
 from python_agent.ids import new_message_id
@@ -22,6 +23,7 @@ from python_agent.llm.types import (
 )
 from python_agent.prompt.assembler import PromptAssembler
 from python_agent.session.session import Session
+from python_agent.tools.policies import ExecuteHandler, PostHandler, PreHandler
 from python_agent.tools.registry import ToolRegistry
 from python_agent.tools.runtime import ToolRuntime
 from python_agent.tools.types import ToolContext
@@ -32,12 +34,21 @@ StepInputProvider = Callable[[], list[UserMessage]]
 
 @dataclass(slots=True)
 class RunResult:
+    """一次 Turn 的返回值。
+
+    answer 是最后一次 assistant 文本，session 保存完整可回放事实，finish_reason 表示
+    模型自然结束、达到上限、工具结束或其他终止原因。把三者一起返回，调用方可以只读
+    答案，也可以继续检查事件和诊断信息。
+    """
+
     answer: str
     session: Session
     finish_reason: str
 
     @property
     def session_id(self) -> str:
+        """返回字符串形式的 Session ID，方便 CLI、日志和 JSON 序列化。"""
+
         return str(self.session.id)
 
 
@@ -59,7 +70,19 @@ class AgentLoop:
         system_prompt: str | None = None,
         workspace: Path | None = None,
         event_handler: EventHandler | None = None,
+        approval_service: ApprovalService | None = None,
+        approval_required: set[str] | frozenset[str] | None = None,
+        spill_directory: Path | None = None,
+        pre_policies: tuple[PreHandler, ...] = (),
+        execute_policies: tuple[ExecuteHandler, ...] = (),
+        post_policies: tuple[PostHandler, ...] = (),
     ) -> None:
+        """创建单次循环。
+
+        这里组装工具策略，但不创建后台 Task；阶段 1的直接调用由当前协程负责资源，
+        阶段 2的 Agent Handle 则把同一循环放进自己拥有的 Driver Task。
+        """
+
         self.config = config or AgentPreset()
         self.adapter = adapter
         self.tools = tools or ToolRegistry()
@@ -70,7 +93,18 @@ class AgentLoop:
         self.prompt_assembler = PromptAssembler.default()
         self.system_prompt = system_prompt or self.prompt_assembler.assemble()
         self.cancel_event = asyncio.Event()
-        self._runtime = ToolRuntime(self.tools, max_result_chars=self.config.max_tool_result_chars)
+        self._runtime = ToolRuntime(
+            self.tools,
+            max_result_chars=self.config.max_tool_result_chars,
+            spill_directory=spill_directory,
+            approval_service=approval_service,
+            approval_required=(
+                self.config.approval_required if approval_required is None else approval_required
+            ),
+            pre_policies=pre_policies,
+            execute_policies=execute_policies,
+            post_policies=post_policies,
+        )
         self.event_handler = event_handler
 
     def cancel(self) -> None:
@@ -88,11 +122,23 @@ class AgentLoop:
         self.cancel_event.clear()
 
     def _resolve_adapter(self) -> ModelAdapter:
+        """解析当前请求要使用的适配器。
+
+        直接传入 Adapter 时原样返回；传入 ModelRouter 时根据配置里的 provider 查找，
+        使 Agent Loop 不需要保存或理解具体 Provider 的客户端。
+        """
+
         if isinstance(self.adapter, ModelRouter):
             return self.adapter.resolve(self.config.provider)
         return self.adapter
 
     def _tool_schemas(self) -> list[dict[str, object]]:
+        """生成发送给模型的工具 Schema，并按配置限制可见工具。
+
+        空的 config.tools 表示暴露注册表中的全部工具；显式列表则先通过 Registry.get
+        校验每个名字存在，避免模型看到一个实际无法执行的工具。
+        """
+
         if not self.config.tools:
             return self.tools.schemas()
         selected = [self.tools.get(name) for name in self.config.tools]
@@ -114,6 +160,8 @@ class AgentLoop:
         return result
 
     def _request(self) -> ModelRequest:
+        """从当前 Session 投影消息，创建本次不可变的 ModelRequest。"""
+
         return ModelRequest(
             provider=self.config.provider,
             model=self.config.model,
@@ -273,6 +321,7 @@ class AgentLoop:
                     await self._emit("assistant/message", assistant_event_data)
 
                     if not response.tool_calls:
+                        # 模型自然结束前再检查一次 next_step，捕获模型请求期间到达的 steer。
                         if step_input_provider is not None:
                             pending_step_messages = step_input_provider()
                         if pending_step_messages:
@@ -306,12 +355,17 @@ class AgentLoop:
                             tool_call_event_data,
                         )
                         await self._emit("tool/call", tool_call_event_data)
+                        if call.name in {"write_file", "apply_patch"}:
+                            # 在进入写工具主体前留下不可变的 intent，便于审批、审计和回放。
+                            self.session.append("tool/write_intent", tool_call_event_data)
+                            await self._emit("tool/write_intent", tool_call_event_data)
                         result = await self._runtime.execute(
                             call,
                             ToolContext(
                                 session_id=self.session.id,
                                 workspace=self.session.header.cwd,
                                 cancel_event=self.cancel_event,
+                                permission_mode=self.config.permission_mode,
                             ),
                         )
                         tool_result_event_data = result.event_data()

@@ -10,6 +10,8 @@ from python_agent.tools.types import ToolContext
 
 
 class ReadFileTool:
+    """按行读取 workspace 内 UTF-8 文件的只读工具。"""
+
     name = "read_file"
     description = "Read a UTF-8 text file inside the workspace by line range."
     parameters = {
@@ -25,9 +27,13 @@ class ReadFileTool:
     timeout_seconds: float | None = 10.0
 
     def is_concurrency_safe(self, arguments: dict[str, Any]) -> bool:
+        """文件读取不会修改文件，因此可与其他只读调用并发。"""
+
         return True
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        """读取文件并应用 offset/limit 行窗口，避免一次把整个大文件送入模型。"""
+
         path = safe_path(arguments["path"], context)
         if not path.is_file():
             raise ToolError(f"file does not exist: {arguments['path']}")

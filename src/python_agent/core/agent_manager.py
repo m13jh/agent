@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from python_agent.approval.service import ApprovalService
 from python_agent.config import AgentPreset
 from python_agent.core.agent import Agent
 from python_agent.hooks.event_bus import LiveEventBus
 from python_agent.ids import SessionId
 from python_agent.llm.adapter import ModelAdapter, ModelRouter
 from python_agent.session.session import Session
+from python_agent.tools.policies import ExecuteHandler, PostHandler, PreHandler
 from python_agent.tools.registry import ToolRegistry
 
 
@@ -17,6 +19,8 @@ class AgentManager:
     """管理当前进程中的 Agent，并确保每个 Handle 都有明确生命周期所有者。"""
 
     def __init__(self, *, event_bus: LiveEventBus | None = None) -> None:
+        """创建 Manager；所有由 create 返回的 Agent 都会登记在本实例中。"""
+
         self.event_bus = event_bus or LiveEventBus()
         self._agents: dict[SessionId, Agent] = {}
 
@@ -29,6 +33,12 @@ class AgentManager:
         session: Session | None = None,
         system_prompt: str | None = None,
         workspace: Path | None = None,
+        approval_service: ApprovalService | None = None,
+        approval_required: set[str] | frozenset[str] | None = None,
+        spill_directory: Path | None = None,
+        pre_policies: tuple[PreHandler, ...] = (),
+        execute_policies: tuple[ExecuteHandler, ...] = (),
+        post_policies: tuple[PostHandler, ...] = (),
     ) -> Agent:
         """创建 Agent、登记所有权并发布 agent/created 通知。"""
 
@@ -40,6 +50,12 @@ class AgentManager:
             system_prompt=system_prompt,
             workspace=workspace,
             event_bus=self.event_bus,
+            approval_service=approval_service,
+            approval_required=approval_required,
+            spill_directory=spill_directory,
+            pre_policies=pre_policies,
+            execute_policies=execute_policies,
+            post_policies=post_policies,
         )
         if agent.id in self._agents:
             await agent.dispose()
@@ -64,6 +80,12 @@ class AgentManager:
         session: Session | None = None,
         system_prompt: str | None = None,
         workspace: Path | None = None,
+        approval_service: ApprovalService | None = None,
+        approval_required: set[str] | frozenset[str] | None = None,
+        spill_directory: Path | None = None,
+        pre_policies: tuple[PreHandler, ...] = (),
+        execute_policies: tuple[ExecuteHandler, ...] = (),
+        post_policies: tuple[PostHandler, ...] = (),
     ) -> Agent:
         """create 的语义别名，方便调用方使用更明确的动词名称。"""
 
@@ -74,6 +96,12 @@ class AgentManager:
             session=session,
             system_prompt=system_prompt,
             workspace=workspace,
+            approval_service=approval_service,
+            approval_required=approval_required,
+            spill_directory=spill_directory,
+            pre_policies=pre_policies,
+            execute_policies=execute_policies,
+            post_policies=post_policies,
         )
 
     def get(self, agent_id: SessionId) -> Agent:
@@ -85,7 +113,10 @@ class AgentManager:
             raise KeyError(f"agent not found: {agent_id}") from exc
 
     def list_agents(self) -> list[Agent]:
-        """返回当前由 Manager 拥有的 Agent 快照。"""
+        """返回当前由 Manager 拥有的 Agent 快照。
+
+        返回新列表而不是内部字典视图，避免调用方遍历期间修改 Manager 的所有权表。
+        """
 
         return list(self._agents.values())
 

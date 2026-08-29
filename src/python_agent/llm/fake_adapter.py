@@ -26,6 +26,8 @@ class FakeAdapter:
         self,
         responses: Iterable[AssistantResponse | dict[str, Any]] | ResponseFactory | None = None,
     ) -> None:
+        """保存脚本或响应工厂，并记录后续收到的 ModelRequest。"""
+
         self.requests: list[ModelRequest] = []
         self._factory = responses if callable(responses) else None
         self._responses = (
@@ -38,6 +40,8 @@ class FakeAdapter:
         *,
         cancel_event: asyncio.Event,
     ) -> AssistantResponse:
+        """记录请求并返回脚本响应；没有脚本时根据最后一条 user 消息生成 Echo。"""
+
         if cancel_event.is_set():
             raise asyncio.CancelledError
         self.requests.append(request)

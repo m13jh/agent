@@ -1,3 +1,9 @@
+"""阶段 1 Agent Loop 的集成测试。
+
+测试使用 FakeAdapter 固定模型输出，专门验证工具调用、下一 Step、错误结果和流式事件；
+这样不会依赖真实 API Key，也能稳定检查 Session 事件和模型请求内容。
+"""
+
 from pathlib import Path
 
 from python_agent.config import AgentPreset
@@ -8,6 +14,8 @@ from python_agent.tools.registry import ToolRegistry
 
 
 async def test_fake_model_tool_model_loop(tmp_path: Path) -> None:
+    """验证模型先读取文件，再根据 tool result 生成最终回答。"""
+
     (tmp_path / "note.txt").write_text("hello from file\n", encoding="utf-8")
     adapter = FakeAdapter(
         [
@@ -37,6 +45,8 @@ async def test_fake_model_tool_model_loop(tmp_path: Path) -> None:
 
 
 async def test_multiple_tool_calls_are_executed_serially() -> None:
+    """验证同一模型响应中的多个工具调用按返回顺序执行和写入日志。"""
+
     adapter = FakeAdapter(
         [
             {
@@ -63,6 +73,8 @@ async def test_multiple_tool_calls_are_executed_serially() -> None:
 
 
 async def test_tool_error_is_visible_to_next_model_step() -> None:
+    """验证参数校验失败会变成下一次模型请求可见的错误消息。"""
+
     adapter = FakeAdapter(
         [
             {
@@ -79,6 +91,8 @@ async def test_tool_error_is_visible_to_next_model_step() -> None:
 
 
 async def test_streaming_adapter_emits_deltas_and_tool_events() -> None:
+    """验证 FakeAdapter 的增量文本和工具生命周期事件都能实时通知调用方。"""
+
     adapter = FakeAdapter(
         [
             {
@@ -92,6 +106,8 @@ async def test_streaming_adapter_emits_deltas_and_tool_events() -> None:
     live_events: list[tuple[str, dict]] = []
 
     def collect(event_type: str, data: dict) -> None:
+        """保存实时事件，供测试按类型和顺序检查流式输出。"""
+
         live_events.append((event_type, data))
 
     result = await AgentLoop(

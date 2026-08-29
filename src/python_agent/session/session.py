@@ -24,6 +24,8 @@ class Session:
         events: Iterable[SessionEvent] = (),
         event_listener: Callable[[SessionEvent], None] | None = None,
     ) -> None:
+        """创建 Session，并按顺序校验加载的历史事件。"""
+
         self.header = header
         self.event_listener = event_listener
         self.events: list[SessionEvent] = []
@@ -38,6 +40,8 @@ class Session:
         cwd: Any = None,
         agent_preset: str | None = None,
     ) -> Session:
+        """创建带新 ID 和 Header 的空 Session。"""
+
         header = SessionHeader(
             id=session_id or new_session_id(),
             cwd=cwd,
@@ -47,9 +51,13 @@ class Session:
 
     @property
     def id(self) -> SessionId:
+        """返回 Header 中稳定的 Session ID，Agent ID 与它共用同一值。"""
+
         return self.header.id
 
     def _append_existing(self, event: SessionEvent) -> None:
+        """加载历史事件时验证 seq 等于当前长度，拒绝断裂或重复日志。"""
+
         expected = len(self.events)
         if event.seq != expected:
             raise SessionError(
@@ -65,6 +73,12 @@ class Session:
         source_event_seqs: list[int] | None = None,
         ignorable: bool = False,
     ) -> SessionEvent:
+        """追加一条事件并分配连续序号。
+
+        序号来自当前事件列表长度，因而新事件只能追加到末尾。事件对象加入内存日志
+        后才通知观察器，监听器看到的必然是已经成功提交的事实。
+        """
+
         event = SessionEvent(
             seq=len(self.events),
             type=event_type,
@@ -87,15 +101,23 @@ class Session:
         self.event_listener = listener
 
     def messages(self) -> list[dict[str, Any]]:
+        """根据完整事件列表重新计算模型消息，不维护第二份消息副本。"""
+
         return derive_messages(self.events)
 
     def transcript(self) -> str:
+        """生成当前 Session 的人工可读 transcript。"""
+
         return render_transcript(self.events)
 
     def next_turn(self) -> int:
+        """根据已有 turn/start 事件计算下一个 Turn 编号。"""
+
         starts = [event.data.get("turn", 0) for event in self.events if event.type == "turn/start"]
         return max(starts, default=0) + 1
 
     def next_step(self) -> int:
+        """根据已有 step/start 事件计算下一个全局 Step 编号。"""
+
         starts = [event.data.get("step", 0) for event in self.events if event.type == "step/start"]
         return max(starts, default=0) + 1

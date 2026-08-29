@@ -19,6 +19,8 @@ class LiveEventBus:
     """
 
     def __init__(self) -> None:
+        """创建空订阅表；每个 AgentManager 通常拥有一条作用域内总线。"""
+
         self._handlers: dict[str, list[EventHandler]] = defaultdict(list)
 
     def subscribe(self, event_type: str, handler: EventHandler) -> Callable[[], None]:
@@ -28,6 +30,8 @@ class LiveEventBus:
         removed = False
 
         def dispose() -> None:
+            """幂等地删除这一次订阅，不影响同一事件的其他监听器。"""
+
             nonlocal removed
             if removed:
                 return
@@ -39,7 +43,11 @@ class LiveEventBus:
         return dispose
 
     async def emit(self, event_type: str, data: dict[str, Any] | None = None) -> None:
-        """按注册顺序通知指定事件和通配符 ``*`` 监听器。"""
+        """按注册顺序通知指定事件和通配符 ``*`` 监听器。
+
+        每个异步监听器都会被 await，保证事件处理完成后生命周期操作才继续，同时不
+        创建未被任何所有者追踪的后台任务。
+        """
 
         payload = dict(data or {})
         handlers = [*self._handlers.get(event_type, []), *self._handlers.get("*", [])]

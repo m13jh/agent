@@ -1,3 +1,9 @@
+"""手工验证阶段 2 Agent Handle 的脚本。
+
+该脚本不依赖 pytest：它通过受控模型暂停和释放，人工观察 inject、steer、并发 followup、
+取消以及 Live Event Bus 的实际运行顺序。
+"""
+
 import asyncio
 
 from python_agent import AgentManager
@@ -12,6 +18,8 @@ class ManualAdapter:
     name = "manual"
 
     def __init__(self):
+        """准备请求记录、模型开始信号和外部释放信号。"""
+
         self.requests = []
         self.started = asyncio.Event()
         self.release = asyncio.Event()
@@ -24,6 +32,8 @@ class ManualAdapter:
         *,
         cancel_event: asyncio.Event,
     ) -> AssistantResponse:
+        """阻塞到 release，模拟模型还未结束时用户插入控制消息。"""
+
         self.requests.append(request)
         self.started.set()
         self.active += 1
@@ -37,6 +47,8 @@ class ManualAdapter:
 
 
 async def main():
+    """依次执行阶段 2的五个手工检查并打印观察结果。"""
+
     event_types = []
     bus = LiveEventBus()
 

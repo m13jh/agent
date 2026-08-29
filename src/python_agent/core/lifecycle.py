@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class CancelCause(BaseModel):
@@ -12,8 +12,10 @@ class CancelCause(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["user", "parent", "timeout", "shutdown", "disposed"]
-    message: str | None = None
+    kind: Literal["user", "parent", "timeout", "shutdown", "disposed"] = Field(
+        description="取消来源，用于区分用户取消、超时、父级传播和释放",
+    )
+    message: str | None = Field(default=None, description="可选的人类可读取消说明")
 
 
 AgentStatus = Literal["idle", "running"]

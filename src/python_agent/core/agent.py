@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from python_agent.approval.service import ApprovalService
 from python_agent.config import AgentPreset
 from python_agent.core.agent_loop import AgentLoop, RunResult
 from python_agent.core.inbox import Inbox, UserMessage
@@ -15,6 +16,7 @@ from python_agent.ids import MessageId, SessionId
 from python_agent.llm.adapter import ModelAdapter, ModelRouter
 from python_agent.session.events import SessionEvent
 from python_agent.session.session import Session
+from python_agent.tools.policies import ExecuteHandler, PostHandler, PreHandler
 from python_agent.tools.registry import ToolRegistry
 
 
@@ -36,7 +38,19 @@ class Agent:
         system_prompt: str | None = None,
         workspace: Path | None = None,
         event_bus: LiveEventBus | None = None,
+        approval_service: ApprovalService | None = None,
+        approval_required: set[str] | frozenset[str] | None = None,
+        spill_directory: Path | None = None,
+        pre_policies: tuple[PreHandler, ...] = (),
+        execute_policies: tuple[ExecuteHandler, ...] = (),
+        post_policies: tuple[PostHandler, ...] = (),
     ) -> None:
+        """创建一个长期存活的 Handle，并把所有 Driver 相关资源绑定到本实例。
+
+        已传入 Session 时会先重放 Inbox 事件；新 Session 则从空队列开始。AgentLoop
+        使用同一 Session，因此输入队列、模型消息和实时事件能够共享一个事实源。
+        """
+
         self.config = config or AgentPreset()
         self.event_bus = event_bus or LiveEventBus()
         self.session = session or Session.new(
@@ -53,6 +67,12 @@ class Agent:
             system_prompt=system_prompt,
             workspace=workspace,
             event_handler=self._on_loop_event,
+            approval_service=approval_service,
+            approval_required=approval_required,
+            spill_directory=spill_directory,
+            pre_policies=pre_policies,
+            execute_policies=execute_policies,
+            post_policies=post_policies,
         )
         self._status: AgentStatus = "idle"
         self._driver_task: asyncio.Task[None] | None = None
@@ -167,6 +187,8 @@ class Agent:
         )
 
     async def _ensure_driver(self) -> None:
+        """在锁保护下检查并创建唯一 Driver；已有 Driver 时只让消息留在 Inbox。"""
+
         async with self._driver_lock:
             if self._disposed or not self.inbox.has_wakeup_pending:
                 return
@@ -236,6 +258,8 @@ class Agent:
         )
 
     def _ensure_not_disposed(self, *, allow_disposed: bool = False) -> None:
+        """阻止已释放 Handle 接收新工作；cancel 的重复收敛可以被显式允许。"""
+
         if self._disposed and not allow_disposed:
             raise RuntimeError(f"agent {self.id} is disposed")
 

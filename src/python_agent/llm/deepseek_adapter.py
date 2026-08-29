@@ -97,6 +97,8 @@ class DeepSeekAdapter:
         timeout_seconds: float | None = None,
         env_file: Path | None = None,
     ) -> None:
+        """解析配置、保存连接参数，并在缺少 API Key 时 fail closed。"""
+
         self.env_file = _load_environment(env_file)
         configured_key = api_key or os.getenv("DEEPSEEK_API_KEY")
         self.api_key = configured_key.strip() if configured_key else None
@@ -112,6 +114,12 @@ class DeepSeekAdapter:
         *,
         cancel_event: asyncio.Event,
     ) -> AssistantResponse:
+        """发送一次非流式 Chat Completions 请求并转换响应。
+
+        当前 AgentLoop 优先使用 stream；保留 complete 是为了兼容简单调用方和只实现
+        非流式协议的测试适配器。
+        """
+
         if cancel_event.is_set():
             raise asyncio.CancelledError
         payload: dict[str, object] = {
@@ -274,6 +282,8 @@ class DeepSeekAdapter:
         return ToolCall(id=CallId(parts["id"]), name=parts["name"], arguments=arguments)
 
     def _request(self, body: bytes) -> Mapping[str, object]:
+        """同步执行一次 HTTP POST；调用方通过 asyncio.to_thread 避免阻塞事件循环。"""
+
         request = Request(
             f"{self.base_url}/chat/completions",
             data=body,
@@ -302,6 +312,8 @@ class DeepSeekAdapter:
         """
 
         def as_mapping(raw: object, label: str) -> Mapping[str, Any]:
+            """把 Provider 动态值收窄为映射，统一生成带字段路径的 ModelError。"""
+
             if not isinstance(raw, Mapping):
                 raise ModelError(f"invalid DeepSeek response: {label} must be an object")
             return raw

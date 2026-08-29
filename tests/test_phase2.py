@@ -1,3 +1,5 @@
+"""阶段 2 Agent Handle、Inbox、Driver 和取消语义的测试。"""
+
 import asyncio
 
 from python_agent.core.agent import Agent
@@ -14,6 +16,8 @@ class GatedAdapter:
     name = "gated"
 
     def __init__(self) -> None:
+        """初始化请求记录、阻塞信号以及并发度统计。"""
+
         self.requests: list[ModelRequest] = []
         self.started = asyncio.Event()
         self.release = asyncio.Event()
@@ -23,6 +27,8 @@ class GatedAdapter:
     async def complete(
         self, request: ModelRequest, *, cancel_event: asyncio.Event
     ) -> AssistantResponse:
+        """等待 release，让测试可以在模型运行期间插入 steer 或 followup。"""
+
         self.requests.append(request)
         self.started.set()
         self.active += 1
@@ -35,6 +41,8 @@ class GatedAdapter:
 
 
 def test_inbox_replays_unclaimed_messages() -> None:
+    """验证 insert/replace/claim 事件可以重放成未消费队列。"""
+
     session = Session.new()
     inbox = Inbox(session)
     first = inbox.append("first", "followup")
@@ -55,6 +63,8 @@ def test_inbox_replays_unclaimed_messages() -> None:
 
 
 async def test_steer_is_applied_at_the_next_step_and_events_are_published() -> None:
+    """验证运行中的 steer 在下一次 ModelRequest 中出现，并发布实时事件。"""
+
     adapter = GatedAdapter()
     bus = LiveEventBus()
     observed: list[str] = []
@@ -76,6 +86,8 @@ async def test_steer_is_applied_at_the_next_step_and_events_are_published() -> N
 
 
 async def test_inject_does_not_wake_idle_but_is_used_by_next_followup() -> None:
+    """验证 idle inject 不调用模型，但会随之后的 followup 进入上下文。"""
+
     adapter = GatedAdapter()
     adapter.release.set()
     agent = Agent(adapter)
@@ -93,6 +105,8 @@ async def test_inject_does_not_wake_idle_but_is_used_by_next_followup() -> None:
 
 
 async def test_concurrent_followups_share_one_driver() -> None:
+    """验证并发 followup 只产生一个活动模型调用，再按 Turn 顺序处理。"""
+
     adapter = GatedAdapter()
     agent = Agent(adapter)
 
@@ -109,6 +123,8 @@ async def test_concurrent_followups_share_one_driver() -> None:
 
 
 async def test_cancel_can_keep_inbox_messages() -> None:
+    """验证取消后 Agent 回到 idle，并在 keep_inbox 下保留未领取消息。"""
+
     adapter = GatedAdapter()
     agent = Agent(adapter)
 

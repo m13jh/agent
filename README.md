@@ -108,6 +108,29 @@ asyncio.run(main())
 `agent/inbox/spliced`，因此可以通过事件重放恢复待处理消息。真正的 JSONL 磁盘持久化
 属于后续阶段。
 
+## 阶段 3 工具策略与安全执行
+
+所有工具调用都会经过三条 Waterfall：Pre 负责参数、路径、权限和审批，Execute 负责
+超时，Post 负责结果规范化、裁剪和 spill。写入工具需要明确指定 workspace-write：
+
+```bash
+python-agent run "更新 README" \
+  --permission-mode workspace-write
+```
+
+`bash` 默认需要审批；没有审批服务时会在工具主体执行前返回错误。只有在明确确认本次
+进程中的所有 Bash 调用都可信时，才使用：
+
+```bash
+python-agent run "检查项目构建" \
+  --permission-mode workspace-write \
+  --approve-bash
+```
+
+超长工具结果会保存到 workspace 下的 `.python-agent/tool-output/`，模型上下文只收到
+预览、总长度和文件路径。应用层也可以传入自己的 `ApprovalService`、Pre/Execute/Post
+策略或 `spill_directory`。
+
 CLI 会实时显示模型文本增量、工具调用和工具结果。DeepSeek 使用 SSE 流式接口；Fake
 Adapter 也会切分文本，用于离线验证同样的显示流程。
 
@@ -136,3 +159,8 @@ python-agent chat
 
 模型在后台运行时仍然可以输入下一条 followup 或 steer；实时输出由 Live Event Bus
 转发到终端。
+
+## 待改进清单
+
+当前问题、根因、优先级、参考 `deepseek-harness` 的实现和验收标准见
+[IMPROVEMENTS.md](IMPROVEMENTS.md)。

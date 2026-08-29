@@ -8,11 +8,17 @@ from python_agent.prompt.sections import PromptSection
 
 
 class PromptAssembler:
+    """保存提示词段落并按固定顺序生成一个系统提示词字符串。"""
+
     def __init__(self, sections: Iterable[PromptSection] = ()) -> None:
+        """复制段落迭代器，避免调用方后续修改原列表影响已创建的组装器。"""
+
         self._sections = tuple(sections)
 
     @classmethod
     def default(cls) -> PromptAssembler:
+        """创建内置五段系统提示词，保证离线和真实 Provider 使用同一身份规则。"""
+
         return cls(
             [
                 PromptSection(
@@ -56,5 +62,7 @@ class PromptAssembler:
         )
 
     def assemble(self) -> str:
+        """按 ``(order, id)`` 排序并用空行拼接所有段落内容。"""
+
         ordered = sorted(self._sections, key=lambda item: (item.order, item.id))
         return "\n\n".join(section.content for section in ordered)

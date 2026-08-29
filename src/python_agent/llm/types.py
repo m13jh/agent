@@ -10,6 +10,12 @@ from python_agent.ids import CallId
 
 
 class Usage(BaseModel):
+    """一次模型请求的 Token 使用量。
+
+    Provider 返回的 usage 字段可能缺失或包含额外字段，因此标准字段默认从 0 开始，
+    同时允许适配器保留额外统计信息。
+    """
+
     model_config = ConfigDict(extra="allow")
 
     prompt_tokens: int = Field(default=0, ge=0)
@@ -18,6 +24,8 @@ class Usage(BaseModel):
 
 
 class ToolCall(BaseModel):
+    """模型要求 Agent 执行一个工具时的标准化调用对象。"""
+
     model_config = ConfigDict(extra="forbid")
 
     id: CallId
@@ -26,6 +34,8 @@ class ToolCall(BaseModel):
 
 
 class ModelRequest(BaseModel):
+    """发送给模型适配器的完整请求快照，包含消息、工具 Schema 和采样参数。"""
+
     model_config = ConfigDict(extra="forbid")
 
     provider: str
@@ -38,6 +48,12 @@ class ModelRequest(BaseModel):
 
 
 class AssistantResponse(BaseModel):
+    """一个模型步骤结束后的完整响应。
+
+    流式响应会先转换为多个 ModelChunk，只有全部片段收齐后才组装为此对象，
+    因此 AgentLoop 不会执行半截工具参数。
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     content: str | None = None
