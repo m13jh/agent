@@ -82,6 +82,29 @@ def _display_event(event_type: str, data: dict[str, Any]) -> None:
             flush=True,
         )
         return
+    if event_type == "subagent/created":
+        print(
+            f"\n[子 Agent 创建] {data.get('child_id')}，深度 "
+            f"{data.get('delegation_depth')}：{data.get('description')}",
+            flush=True,
+        )
+        return
+    if event_type == "subagent/settled":
+        print(
+            f"\n[子 Agent 完成] {data.get('child_id')}，结束原因：{data.get('finish_reason')}",
+            flush=True,
+        )
+        return
+    if event_type == "subagent/disposed":
+        print(f"\n[子 Agent 释放] {data.get('child_id')}", flush=True)
+        return
+    if event_type == "subagent/error":
+        print(
+            f"\n[子 Agent 错误] {data.get('child_id')}："
+            f"{data.get('error_type')} {data.get('message')}",
+            flush=True,
+        )
+        return
     if event_type == "model/request_end":
         raw_duration = data.get("duration_ms", 0)
         duration_ms = raw_duration if isinstance(raw_duration, int | float) else 0
@@ -196,6 +219,13 @@ def _add_agent_options(command: argparse.ArgumentParser) -> None:
     command.add_argument("--model-max-retries", type=int, default=2)
     command.add_argument("--model-retry-base-delay-seconds", type=float, default=0.5)
     command.add_argument(
+        "--enable-subagents",
+        action="store_true",
+        help="expose bounded in-process subagent management tools",
+    )
+    command.add_argument("--max-subagent-depth", type=int, default=2)
+    command.add_argument("--max-subagents", type=int, default=8)
+    command.add_argument(
         "--session-root",
         type=Path,
         default=None,
@@ -306,6 +336,8 @@ async def _create_agent(args: argparse.Namespace) -> tuple[AgentManager, Agent]:
         preset_id += ":p5=" + ",".join(
             "none" if value is None else str(value) for value in phase5_values
         )
+    if args.enable_subagents:
+        preset_id += f":p6=depth{args.max_subagent_depth},children{args.max_subagents}"
     config = AgentPreset(
         id=preset_id,
         provider=args.provider,
@@ -319,6 +351,9 @@ async def _create_agent(args: argparse.Namespace) -> tuple[AgentManager, Agent]:
         output_cost_per_million_tokens=args.output_cost_per_million_tokens,
         model_max_retries=args.model_max_retries,
         model_retry_base_delay_seconds=args.model_retry_base_delay_seconds,
+        subagents_enabled=args.enable_subagents,
+        max_delegation_depth=args.max_subagent_depth,
+        max_subagents=args.max_subagents,
         workspace=workspace,
         permission_mode=args.permission_mode,
     )

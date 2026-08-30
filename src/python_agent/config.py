@@ -85,6 +85,22 @@ class AgentPreset(BaseModel):
         default=("bash",),
         description="必须经过 ApprovalService 的高风险工具名称",
     )
+    subagents_enabled: bool = Field(
+        default=False,
+        description="是否为此 Agent 注册进程内子 Agent 管理工具",
+    )
+    max_delegation_depth: int = Field(
+        default=2,
+        ge=0,
+        le=16,
+        description="允许的最大 Session delegation_depth；根 Agent 深度为 0",
+    )
+    max_subagents: int = Field(
+        default=8,
+        gt=0,
+        le=128,
+        description="一个直接父 Agent 在当前进程中最多创建的子 Agent 数量",
+    )
 
 
 AgentConfig = AgentPreset

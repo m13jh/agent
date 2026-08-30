@@ -65,3 +65,14 @@ class ToolRegistry:
                 }
             result.append(value)
         return result
+
+    def subset(self, names: Iterable[str]) -> ToolRegistry:
+        """创建只包含指定工具的新注册表，工具定义对象本身保持共享。
+
+        子 Agent 使用该方法获得父级工具集合的严格子集。每个名称都通过 ``get`` 校验，
+        未授权或拼写错误不会被静默忽略；新注册表拥有独立映射，后续注册管理工具不会
+        反向修改父 Agent 的 Registry。
+        """
+
+        selected = [self.get(name) for name in sorted(set(names))]
+        return ToolRegistry(selected)

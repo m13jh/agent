@@ -16,18 +16,19 @@
   transcript 导出，以及物理/语义崩溃尾部的保守修复。
 - 阶段 5：有界 parallel/exclusive 工具调度、模型顺序结果提交、Turn 级 Token/费用/
   wall-time 预算，以及可注入的模型请求有限重试策略。
+- 阶段 6：进程内 SubagentManager、独立 child Session、多 Turn followup、interrupt、
+  直接父级鉴权、工具子集、最大深度/数量、结果通知和 child-first dispose。
 
 当前全量检查基线：
 
 ~~~text
 ruff：通过
 mypy：通过
-pytest：56 passed
+pytest：63 passed
 ~~~
 
 以下功能属于架构文档后续阶段，本文不把它们误记为当前缺陷：
 
-- 阶段 6：进程内子 Agent。
 - 阶段 7：上下文压缩、Session fork、Skills、SQLite、Web API/UI。
 
 ## 2. 已发生的问题：流式工具参数不完整
@@ -355,7 +356,7 @@ P0-5 大工具调用集成测试
     ↓
 P1-1/P1-2 上下文和工具输出治理
     ↓
-阶段 6 进程内子 Agent
+阶段 7 按实际需求选择高级扩展
 ~~~
 
 ## 9. 待确认的产品策略

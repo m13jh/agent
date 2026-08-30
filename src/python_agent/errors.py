@@ -51,3 +51,15 @@ class ToolValidationError(ToolError):
 
 class AgentLimitError(AgentError):
     """Agent 达到了配置的步骤、Token 或其他执行上限。"""
+
+
+class SubagentError(AgentError):
+    """子 Agent 创建、控制或生命周期收敛失败。"""
+
+
+class SubagentPermissionError(SubagentError):
+    """调用方不是目标子 Agent 的直接父级，或请求了未授权能力。"""
+
+
+class SubagentLimitError(SubagentError):
+    """子 Agent 超过最大深度、数量、步数或其他委派限制。"""

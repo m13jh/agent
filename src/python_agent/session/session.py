@@ -6,7 +6,7 @@ import os
 import tempfile
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from python_agent.errors import SessionError
 from python_agent.ids import SessionId, new_session_id
@@ -51,6 +51,9 @@ class Session:
         session_id: SessionId | None = None,
         cwd: Any = None,
         agent_preset: str | None = None,
+        parent_session_id: SessionId | None = None,
+        origin: Literal["user", "subagent"] = "user",
+        delegation_depth: int = 0,
     ) -> Session:
         """创建带新 ID 和 Header 的空 Session。"""
 
@@ -58,6 +61,9 @@ class Session:
             id=session_id or new_session_id(),
             cwd=cwd,
             agent_preset=agent_preset,
+            parent_session_id=parent_session_id,
+            origin=origin,
+            delegation_depth=delegation_depth,
         )
         return cls(header)
 

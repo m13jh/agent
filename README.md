@@ -1,8 +1,8 @@
 # python-agent
 
 `python-agent` 是一个小而清晰的原生 Python Agent Harness。当前版本已完成架构文档中的
-阶段 0—5：除“模型 → 工具 → 模型”闭环、Agent Handle 和安全工具流水线外，还提供
-JSONL Session 持久化、崩溃恢复、有界工具并发、Turn 预算和模型请求有限重试。
+阶段 0—6：除“模型 → 工具 → 模型”闭环、Agent Handle 和安全工具流水线外，还提供
+JSONL Session 持久化、有界工具并发、Turn 预算、模型重试和受控的进程内子 Agent。
 
 ## 安装
 
@@ -266,6 +266,56 @@ python-agent run "执行受预算限制的任务" \
 模型请求失败会写入 `request/error`；默认策略对传输/响应错误有限指数退避，对认证、配额
 和请求参数错误不重试。每次获准重试还会写入 `request/retry`，但不会复制 user/message 或
 创建额外 Step。应用可以通过 `request_retry_policy` 注入自己的异步决策策略。
+
+## 阶段 6 进程内子 Agent
+
+CLI 通过显式开关向模型暴露子 Agent 工具：
+
+```bash
+python-agent chat \
+  --enable-subagents \
+  --max-subagent-depth 2 \
+  --max-subagents 8
+```
+
+注册的管理工具包括：
+
+```text
+spawn_agent          创建独立 child Session，可选择等待结果
+subagent_followup    向直接 child 提交新 Turn
+subagent_interrupt   取消直接 child 并清空其待处理 Inbox
+list_subagents       列出当前父级的直接孩子
+```
+
+每个 child 都有独立 SessionId、Header、Inbox、单 Driver 和后代，Header 会记录
+`parent_session_id`、`origin=subagent` 与 `delegation_depth`。子 Agent 继承父级 workspace、
+权限、预算和审批要求；`allowed_tools` 必须是父级实际授权集合的子集，管理工具会为每个
+父级重新绑定，不能复用其他父级实例。
+
+子任务结束后会发布 `subagent/settled`，并把带 child ID 和 finish reason 的结果以 inject
+写入父 Agent Inbox。父 Agent dispose 或应用 shutdown 时，Manager 按 grandchild → child
+→ parent 顺序取消 watcher 和 Agent Handle，不遗留后台任务。
+
+Python API：
+
+```python
+from python_agent import SubagentSpec
+
+child_id = await manager.subagents.start(
+    parent,
+    "检查测试失败原因",
+    SubagentSpec(
+        description="测试诊断",
+        allowed_tools={"read_file", "search_text"},
+        max_steps=10,
+    ),
+)
+settled = await manager.subagents.wait(parent, child_id)
+await manager.subagents.followup(parent, child_id, "再检查边界条件")
+```
+
+当前阶段是进程内 Provider：child Session 会持久化，但进程重启后不会自动重建整棵活跃
+父子管理图；跨进程树恢复和远程 Subagent Provider 属于后续扩展。
 
 ## 待改进清单
 

@@ -115,6 +115,12 @@ class Agent:
 
         return self.loop.active_request
 
+    @property
+    def tools(self) -> ToolRegistry:
+        """返回 AgentLoop 使用的 Registry，供受控能力派生和子 Agent 工具过滤。"""
+
+        return self.loop.tools
+
     async def run(self, prompt: str) -> RunResult:
         """兼容阶段 1 的单次 API：提交 followup 并等待 Agent 重新 idle。"""
 

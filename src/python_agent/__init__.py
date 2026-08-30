@@ -15,6 +15,8 @@ from python_agent.llm.retry import DefaultModelRetryPolicy, ModelRetryPolicy, Re
 from python_agent.session.jsonl_store import JsonlSessionStore
 from python_agent.session.session import Session
 from python_agent.session.store import SessionStore
+from python_agent.subagents.manager import SubagentManager
+from python_agent.subagents.types import SubagentInfo, SubagentSettled, SubagentSpec
 
 __all__ = [
     "Agent",
@@ -32,6 +34,10 @@ __all__ = [
     "RunResult",
     "Session",
     "SessionStore",
+    "SubagentInfo",
+    "SubagentManager",
+    "SubagentSettled",
+    "SubagentSpec",
 ]
 
 __version__ = "0.1.0"

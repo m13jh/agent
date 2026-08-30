@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Literal
 
 from python_agent.approval.service import ApprovalService
 from python_agent.config import AgentPreset
@@ -16,6 +17,7 @@ from python_agent.llm.retry import ModelRetryPolicy
 from python_agent.session.events import SessionHeader
 from python_agent.session.session import Session
 from python_agent.session.store import SessionStore
+from python_agent.subagents.manager import SubagentManager
 from python_agent.tools.policies import ExecuteHandler, PostHandler, PreHandler
 from python_agent.tools.registry import ToolRegistry
 
@@ -41,6 +43,7 @@ class AgentManager:
         self.session_store = session_store
         self._presets: dict[str, AgentPreset] = dict(presets or {})
         self._agents: dict[SessionId, Agent] = {}
+        self.subagents = SubagentManager(self)
 
     def register_preset(self, preset: AgentPreset) -> None:
         """登记可用于恢复的不可变 preset；重复 ID 必须显式报错。"""
@@ -65,6 +68,9 @@ class AgentManager:
         execute_policies: tuple[ExecuteHandler, ...] = (),
         post_policies: tuple[PostHandler, ...] = (),
         request_retry_policy: ModelRetryPolicy | None = None,
+        parent_session_id: SessionId | None = None,
+        origin: Literal["user", "subagent"] = "user",
+        delegation_depth: int = 0,
     ) -> Agent:
         """创建 Agent、登记所有权并发布 agent/created 通知。
 
@@ -73,13 +79,19 @@ class AgentManager:
         """
 
         resolved_config = config or AgentPreset()
-        if session is None and self.session_store is not None:
-            session = await self.session_store.create(
-                SessionHeader(
-                    id=new_session_id(),
-                    cwd=workspace or resolved_config.workspace,
-                    agent_preset=resolved_config.id,
-                )
+        if session is None:
+            header = SessionHeader(
+                id=new_session_id(),
+                cwd=workspace or resolved_config.workspace,
+                parent_session_id=parent_session_id,
+                origin=origin,
+                delegation_depth=delegation_depth,
+                agent_preset=resolved_config.id,
+            )
+            session = (
+                await self.session_store.create(header)
+                if self.session_store is not None
+                else Session(header)
             )
 
         agent = Agent(
@@ -99,6 +111,7 @@ class AgentManager:
             request_retry_policy=request_retry_policy,
         )
         await self._register_agent(agent)
+        self.subagents.enable_for(agent)
         return agent
 
     async def _register_agent(self, agent: Agent) -> None:
@@ -224,6 +237,7 @@ class AgentManager:
             recover_orphaned_claims=True,
         )
         await self._register_agent(agent)
+        self.subagents.enable_for(agent)
         await agent.resume_pending()
         return agent
 
@@ -235,6 +249,11 @@ class AgentManager:
         except KeyError as exc:
             raise KeyError(f"agent not found: {agent_id}") from exc
 
+    def maybe_get(self, agent_id: SessionId) -> Agent | None:
+        """返回可选 Agent，供子 Agent watcher 在父级释放竞态中安全查询。"""
+
+        return self._agents.get(agent_id)
+
     def list_agents(self) -> list[Agent]:
         """返回当前由 Manager 拥有的 Agent 快照。
 
@@ -244,18 +263,35 @@ class AgentManager:
         return list(self._agents.values())
 
     async def dispose(self, agent_id: SessionId) -> None:
-        """释放一个 Agent，并在释放成功后移除 Manager 所有权记录。"""
+        """先 child-first 释放全部后代，再释放目标 Agent 和父子索引。"""
 
-        agent = self.get(agent_id)
+        self.get(agent_id)
+        await self.subagents.dispose_descendants(agent_id)
+        await self._dispose_agent_only(agent_id)
+        await self.subagents.detach(agent_id)
+
+    async def _dispose_agent_only(self, agent_id: SessionId) -> None:
+        """只释放一个 Handle；递归顺序由 SubagentManager 或公开 dispose 负责。"""
+
+        agent = self._agents.get(agent_id)
+        if agent is None:
+            return
         await agent.dispose()
         self._agents.pop(agent_id, None)
 
     async def shutdown(self) -> None:
         """应用退出时释放所有 Agent，防止遗留 Driver Task。"""
 
-        agents = self.list_agents()
-        for agent in agents:
-            await agent.dispose()
+        # 优先从根开始会自然触发 child-first；异常状态下遗留的孤儿随后单独收敛。
+        roots = [
+            agent for agent in self.list_agents() if agent.session.header.parent_session_id is None
+        ]
+        for agent in roots:
+            if agent.id in self._agents:
+                await self.dispose(agent.id)
+        for agent in self.list_agents():
+            if agent.id in self._agents:
+                await self.dispose(agent.id)
         self._agents.clear()
 
 
