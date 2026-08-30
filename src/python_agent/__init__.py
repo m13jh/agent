@@ -12,9 +12,12 @@ from python_agent.core.lifecycle import CancelCause
 from python_agent.hooks.event_bus import LiveEventBus
 from python_agent.llm.fake_adapter import FakeAdapter
 from python_agent.llm.retry import DefaultModelRetryPolicy, ModelRetryPolicy, RetryDecision
+from python_agent.session.compaction import ContextCompactor, StaticSummaryProvider, SummaryProvider
 from python_agent.session.jsonl_store import JsonlSessionStore
 from python_agent.session.session import Session
+from python_agent.session.sqlite_index import SessionSearchHit, SqliteSessionIndex
 from python_agent.session.store import SessionStore
+from python_agent.skills.registry import SkillRegistry
 from python_agent.subagents.manager import SubagentManager
 from python_agent.subagents.types import SubagentInfo, SubagentSettled, SubagentSpec
 
@@ -24,6 +27,7 @@ __all__ = [
     "AgentManager",
     "AgentPreset",
     "CancelCause",
+    "ContextCompactor",
     "DefaultModelRetryPolicy",
     "FakeAdapter",
     "JsonlSessionStore",
@@ -33,11 +37,16 @@ __all__ = [
     "RetryDecision",
     "RunResult",
     "Session",
+    "SessionSearchHit",
     "SessionStore",
+    "SkillRegistry",
+    "SqliteSessionIndex",
+    "StaticSummaryProvider",
     "SubagentInfo",
     "SubagentManager",
     "SubagentSettled",
     "SubagentSpec",
+    "SummaryProvider",
 ]
 
 __version__ = "0.1.0"

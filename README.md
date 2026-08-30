@@ -1,8 +1,8 @@
 # python-agent
 
 `python-agent` 是一个小而清晰的原生 Python Agent Harness。当前版本已完成架构文档中的
-阶段 0—6：除“模型 → 工具 → 模型”闭环、Agent Handle 和安全工具流水线外，还提供
-JSONL Session 持久化、有界工具并发、Turn 预算、模型重试和受控的进程内子 Agent。
+阶段 0—7 的当前选定能力：除 Agent 循环、安全工具、持久化、预算和子 Agent 外，还提供
+可重放上下文压缩、Session 分支、按需 Skills 和 SQLite 跨 Session 检索。
 
 ## 安装
 
@@ -316,6 +316,83 @@ await manager.subagents.followup(parent, child_id, "再检查边界条件")
 
 当前阶段是进程内 Provider：child Session 会持久化，但进程重启后不会自动重建整棵活跃
 父子管理图；跨进程树恢复和远程 Subagent Provider 属于后续扩展。
+
+## 阶段 7 选定高级扩展
+
+架构文档把阶段 7 定义为按需求选择，而不是一次实现全部平台功能。本版本选择了四项与
+当前事件内核直接衔接的能力。
+
+### 可重放上下文压缩
+
+`ContextCompactor` 只压缩已经完整关闭的旧 Turn。它不会删除原始事件，而是在日志尾部
+追加 `context/summary`，并用 `source_event_seqs` 指向被替换范围。投影器会在原位置显示
+summary、隐藏旧消息表面，因此磁盘恢复和重复投影完全一致，多次 summary 也可以嵌套替换。
+
+CLI 使用经过人工审阅的摘要：
+
+```bash
+python-agent compact SESSION_ID \
+  --session-root .python-agent \
+  --keep-recent-turns 2 \
+  --summary-file reviewed-summary.md
+```
+
+### Session fork
+
+```bash
+python-agent fork SESSION_ID \
+  --session-root .python-agent \
+  --target-id experiment-branch
+```
+
+fork 精确复制事件快照，后续追加互不影响。Header 使用 `forked_from_session_id` 记录来源，
+不会再把分支错误地标记成子 Agent 的 `parent_session_id`。
+
+### 按需 Skills
+
+启用 Skill 根目录：
+
+```bash
+python-agent chat --skills-root ./skills
+```
+
+每个 Skill 使用：
+
+```text
+skills/review/
+├── skill.toml
+└── SKILL.md
+```
+
+`skill.toml` 示例：
+
+```toml
+name = "review"
+description = "Review code changes"
+instructions_file = "SKILL.md"
+allowed_tools = ["read_file", "search_text"]
+```
+
+模型先调用 `list_skills` 获取轻量元数据，需要时再调用 `load_skill`。完整指令先记录为
+`tool/result`，下一 Step 才进入模型上下文；路径、文件大小和声明工具集合都会校验。
+
+### SQLite 跨 Session 搜索
+
+JSONL 继续是真相源，SQLite 只是可删除、可重建的查询索引：
+
+```bash
+python-agent index-sessions \
+  --session-root .python-agent \
+  --index .python-agent/index.sqlite3
+
+python-agent search-sessions "durable inbox" \
+  --index .python-agent/index.sqlite3 \
+  --limit 20
+```
+
+索引覆盖 user、assistant、tool call/result 和 context summary，并支持限制到单个 Session。
+多进程/远程 Subagent Provider、Code Mode、LSP、PTY、OS 沙箱和 Web/RPC UI 仍属于独立的
+后续平台工程，本版本没有把它们冒充成已完成能力。
 
 ## 待改进清单
 

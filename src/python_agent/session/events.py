@@ -37,6 +37,10 @@ class SessionHeader(BaseModel):
     created_at: datetime = Field(default_factory=utc_now, description="创建时间，使用 UTC")
     cwd: Path | None = Field(default=None, description="本次 Agent 可见的工作目录")
     parent_session_id: SessionId | None = Field(default=None, description="父 Agent Session ID")
+    forked_from_session_id: SessionId | None = Field(
+        default=None,
+        description="Session fork 的来源 ID；与子 Agent parent_session_id 语义分离",
+    )
     origin: Literal["user", "subagent"] = Field(
         default="user",
         description="Session 是用户 Agent 还是子 Agent 创建的",

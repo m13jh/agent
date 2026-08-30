@@ -241,6 +241,26 @@ class AgentManager:
         await agent.resume_pending()
         return agent
 
+    async def fork_session(
+        self,
+        source_id: SessionId,
+        target_id: SessionId | None = None,
+    ) -> Session:
+        """复制持久化事件快照创建独立分支，但不自动启动新 Agent。"""
+
+        if self.session_store is None:
+            raise ConfigurationError("AgentManager.fork_session requires a SessionStore")
+        resolved_target = target_id or new_session_id()
+        session = await self.session_store.fork(source_id, resolved_target)
+        await self.event_bus.emit(
+            "session/forked",
+            {
+                "source_session_id": str(source_id),
+                "target_session_id": str(resolved_target),
+            },
+        )
+        return session
+
     def get(self, agent_id: SessionId) -> Agent:
         """根据稳定 ID 返回 Agent；不存在时明确失败。"""
 

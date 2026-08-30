@@ -324,7 +324,8 @@ async def test_transcript_export_list_and_fork_are_deterministic(tmp_path: Path)
     assert destination.read_text(encoding="utf-8") == source.transcript()
 
     forked = await store.fork(source_id, SessionId("forked"))
-    assert forked.header.parent_session_id == source_id
+    assert forked.header.parent_session_id is None
+    assert forked.header.forked_from_session_id == source_id
     assert forked.messages() == source.messages()
     assert [event.model_dump() for event in forked.events] == [
         event.model_dump() for event in source.events

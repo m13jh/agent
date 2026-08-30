@@ -101,6 +101,10 @@ class AgentPreset(BaseModel):
         le=128,
         description="一个直接父 Agent 在当前进程中最多创建的子 Agent 数量",
     )
+    skills_root: Path | None = Field(
+        default=None,
+        description="可按需加载的 Skill 根目录；None 表示不暴露 Skill 工具",
+    )
 
 
 AgentConfig = AgentPreset

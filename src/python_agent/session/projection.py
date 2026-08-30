@@ -46,6 +46,72 @@ def _tool_call(call: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _summary_replacements(
+    events: list[SessionEvent] | tuple[SessionEvent, ...],
+) -> tuple[dict[int, list[dict[str, str]]], set[int]]:
+    """预计算 active context/summary 的虚拟插入位置和被替换事件集合。
+
+    summary 本身追加在日志尾部，但模型消息必须出现在被替换前缀原来的位置。后续 summary
+    可以把旧 summary seq 作为来源；这里递归展开到最初事件，使多次压缩仍是确定性纯投影。
+    """
+
+    summaries = {event.seq: event for event in events if event.type == "context/summary"}
+    referenced_summaries: set[int] = set()
+    for event in summaries.values():
+        for source_seq in event.source_event_seqs or []:
+            if source_seq in summaries:
+                referenced_summaries.add(source_seq)
+    active = [event for seq, event in summaries.items() if seq not in referenced_summaries]
+
+    def expand_source(seq: int, seen: set[int]) -> set[int]:
+        """把嵌套 summary 来源递归还原为原始事件 seq。"""
+
+        if seq < 0 or seq >= len(events):
+            raise ProjectionError(f"context summary references unknown event seq {seq}")
+        if seq in seen:
+            raise ProjectionError("context summary source graph contains a cycle")
+        summary = summaries.get(seq)
+        if summary is None:
+            return {seq}
+        sources = summary.source_event_seqs or []
+        if not sources:
+            raise ProjectionError(f"context/summary at seq {seq} has no sources")
+        expanded: set[int] = set()
+        for source in sources:
+            expanded.update(expand_source(source, {*seen, seq}))
+        return expanded
+
+    insertions: dict[int, list[dict[str, str]]] = {}
+    suppressed: set[int] = set()
+    for summary in sorted(active, key=lambda event: event.seq):
+        sources = summary.source_event_seqs or []
+        if not sources:
+            raise ProjectionError(f"context/summary at seq {summary.seq} has no sources")
+        if any(source >= summary.seq for source in sources):
+            raise ProjectionError(
+                f"context/summary at seq {summary.seq} must only reference earlier events"
+            )
+        expanded: set[int] = set()
+        for source in sources:
+            expanded.update(expand_source(source, {summary.seq}))
+        overlap = suppressed & expanded
+        if overlap:
+            raise ProjectionError(
+                "active context summaries overlap source events: "
+                + ", ".join(str(seq) for seq in sorted(overlap))
+            )
+        content = summary.data.get("content")
+        role = summary.data.get("role", "user")
+        if not isinstance(content, str) or not content:
+            raise ProjectionError(f"context/summary at seq {summary.seq} has no content")
+        if role not in {"user", "assistant"}:
+            raise ProjectionError(f"context/summary at seq {summary.seq} has invalid role")
+        insertion = min(expanded)
+        insertions.setdefault(insertion, []).append({"role": role, "content": content})
+        suppressed.update(expanded)
+    return insertions, suppressed
+
+
 def derive_messages(events: list[SessionEvent] | tuple[SessionEvent, ...]) -> list[dict[str, Any]]:
     """从只追加事件序列派生稳定的 OpenAI 风格消息。
 
@@ -57,8 +123,12 @@ def derive_messages(events: list[SessionEvent] | tuple[SessionEvent, ...]) -> li
     messages: list[dict[str, Any]] = []
     known_calls: set[str] = set()
     returned_calls: set[str] = set()
+    summary_insertions, suppressed = _summary_replacements(events)
 
     for event in events:
+        messages.extend(summary_insertions.get(event.seq, []))
+        if event.type == "context/summary" or event.seq in suppressed:
+            continue
         if event.ignorable:
             continue
         data = event.data
@@ -145,6 +215,12 @@ def render_transcript(events: list[SessionEvent] | tuple[SessionEvent, ...]) -> 
         elif event.type == "tool/result":
             lines.append(
                 f"tool result {event.data.get('call_id')}: {_text(event.data.get('content'))}"
+            )
+        elif event.type == "context/summary":
+            sources = event.source_event_seqs or []
+            lines.append(
+                f"context summary replaces {sources[0] if sources else '?'}.."
+                f"{sources[-1] if sources else '?'}: {_text(event.data.get('content', ''))}"
             )
         elif event.type in {"turn/start", "turn/end", "step/start", "step/end"}:
             lines.append(f"{event.type}: {_text(event.data)}")

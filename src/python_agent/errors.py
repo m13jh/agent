@@ -63,3 +63,7 @@ class SubagentPermissionError(SubagentError):
 
 class SubagentLimitError(SubagentError):
     """子 Agent 超过最大深度、数量、步数或其他委派限制。"""
+
+
+class SkillError(AgentError):
+    """Skill 清单、路径、内容或工具授权无效。"""

@@ -26,12 +26,16 @@ from python_agent.core.agent import Agent
 from python_agent.core.agent_manager import AgentManager
 from python_agent.core.lifecycle import CancelCause
 from python_agent.hooks.event_bus import LiveEventBus
-from python_agent.ids import CallId, SessionId
+from python_agent.ids import CallId, SessionId, new_session_id
 from python_agent.llm.adapter import ModelAdapter
 from python_agent.llm.deepseek_adapter import DeepSeekAdapter
 from python_agent.llm.fake_adapter import FakeAdapter, ResponseFactory
 from python_agent.llm.types import AssistantResponse, ModelRequest, ToolCall
+from python_agent.session.compaction import ContextCompactor, StaticSummaryProvider
 from python_agent.session.jsonl_store import JsonlSessionStore
+from python_agent.session.sqlite_index import SqliteSessionIndex
+from python_agent.skills.registry import SkillRegistry
+from python_agent.skills.tool import ListSkillsTool, LoadSkillTool
 from python_agent.tools.builtins import (
     ApplyPatchTool,
     BashTool,
@@ -226,6 +230,12 @@ def _add_agent_options(command: argparse.ArgumentParser) -> None:
     command.add_argument("--max-subagent-depth", type=int, default=2)
     command.add_argument("--max-subagents", type=int, default=8)
     command.add_argument(
+        "--skills-root",
+        type=Path,
+        default=None,
+        help="directory containing declarative on-demand skills",
+    )
+    command.add_argument(
         "--session-root",
         type=Path,
         default=None,
@@ -282,6 +292,33 @@ def build_parser() -> argparse.ArgumentParser:
     repair = subparsers.add_parser("repair", help="repair a recoverable Session crash tail")
     repair.add_argument("session_id")
     repair.add_argument("--session-root", type=Path, default=Path(".python-agent"))
+
+    fork = subparsers.add_parser("fork", help="fork a persisted Session into an independent branch")
+    fork.add_argument("session_id")
+    fork.add_argument("--target-id")
+    fork.add_argument("--session-root", type=Path, default=Path(".python-agent"))
+
+    compact = subparsers.add_parser("compact", help="append a reviewed context summary")
+    compact.add_argument("session_id")
+    summary = compact.add_mutually_exclusive_group(required=True)
+    summary.add_argument("--summary")
+    summary.add_argument("--summary-file", type=Path)
+    compact.add_argument("--keep-recent-turns", type=int, default=2)
+    compact.add_argument("--session-root", type=Path, default=Path(".python-agent"))
+
+    index_sessions = subparsers.add_parser(
+        "index-sessions", help="rebuild a derived SQLite cross-session index"
+    )
+    index_sessions.add_argument("--session-root", type=Path, default=Path(".python-agent"))
+    index_sessions.add_argument("--index", type=Path, default=Path(".python-agent/index.sqlite3"))
+
+    search_sessions = subparsers.add_parser(
+        "search-sessions", help="search the derived SQLite session index"
+    )
+    search_sessions.add_argument("query")
+    search_sessions.add_argument("--index", type=Path, default=Path(".python-agent/index.sqlite3"))
+    search_sessions.add_argument("--session-id")
+    search_sessions.add_argument("--limit", type=int, default=20)
     return parser
 
 
@@ -308,6 +345,17 @@ async def _create_agent(args: argparse.Namespace) -> tuple[AgentManager, Agent]:
             BashTool(),
         ]
     )
+    workspace = args.workspace.resolve()
+    skills_root: Path | None = None
+    if args.skills_root is not None:
+        skills_root = (
+            args.skills_root.expanduser().resolve()
+            if args.skills_root.is_absolute()
+            else (workspace / args.skills_root).resolve()
+        )
+        skill_registry = SkillRegistry(skills_root)
+        registry.register(ListSkillsTool(skill_registry))
+        registry.register(LoadSkillTool(skill_registry, registry))
     if args.provider == "deepseek":
         # DeepSeekAdapter 在初始化时读取 .env；model 再从命令行、环境变量或默认值解析。
         adapter: ModelAdapter = DeepSeekAdapter()
@@ -317,7 +365,6 @@ async def _create_agent(args: argparse.Namespace) -> tuple[AgentManager, Agent]:
         demo_read = getattr(args, "demo_read", None)
         adapter = FakeAdapter(_demo_responder(demo_read) if demo_read else None)
         model = args.model or "fake-model"
-    workspace = args.workspace.resolve()
     # CLI 没有独立的 preset 配置文件，因此把影响恢复能力的关键选项编码进稳定 ID。
     # 用户若用不同 Provider、模型、权限或步数恢复，Manager 会因 ID 不匹配而明确拒绝。
     preset_id = f"cli-v1:{args.provider}:{model}:{args.permission_mode}:steps={args.max_steps}"
@@ -338,6 +385,8 @@ async def _create_agent(args: argparse.Namespace) -> tuple[AgentManager, Agent]:
         )
     if args.enable_subagents:
         preset_id += f":p6=depth{args.max_subagent_depth},children{args.max_subagents}"
+    if skills_root is not None:
+        preset_id += f":skills={skills_root}"
     config = AgentPreset(
         id=preset_id,
         provider=args.provider,
@@ -354,6 +403,7 @@ async def _create_agent(args: argparse.Namespace) -> tuple[AgentManager, Agent]:
         subagents_enabled=args.enable_subagents,
         max_delegation_depth=args.max_subagent_depth,
         max_subagents=args.max_subagents,
+        skills_root=skills_root,
         workspace=workspace,
         permission_mode=args.permission_mode,
     )
@@ -454,6 +504,62 @@ async def _repair_persisted_session(args: argparse.Namespace) -> int:
             indent=2,
         )
     )
+    return 0
+
+
+async def _fork_persisted_session(args: argparse.Namespace) -> int:
+    """复制事件快照创建独立 Session 分支。"""
+
+    store = JsonlSessionStore(args.session_root.expanduser().resolve())
+    target_id = SessionId(args.target_id) if args.target_id else new_session_id()
+    forked = await store.fork(SessionId(args.session_id), target_id)
+    print(forked.id)
+    return 0
+
+
+async def _compact_persisted_session(args: argparse.Namespace) -> int:
+    """使用用户审阅摘要压缩完整旧 Turn 的模型可见表面。"""
+
+    store = JsonlSessionStore(args.session_root.expanduser().resolve())
+    session = await store.load(SessionId(args.session_id))
+    if args.summary_file is not None:
+        summary = args.summary_file.expanduser().read_text(encoding="utf-8")
+    else:
+        summary = args.summary
+    result = await ContextCompactor().compact(
+        session,
+        StaticSummaryProvider(summary),
+        keep_recent_turns=args.keep_recent_turns,
+    )
+    if result is None:
+        print("没有新的完整旧 Turn 需要压缩。")
+    else:
+        print(
+            f"summary_event_seq={result.event.seq} "
+            f"replaced_turns={list(result.replaced_turns)} "
+            f"replaced_events={result.replaced_event_count}"
+        )
+    return 0
+
+
+async def _index_persisted_sessions(args: argparse.Namespace) -> int:
+    """从严格 JSONL 真相源重建派生 SQLite 索引。"""
+
+    store = JsonlSessionStore(args.session_root.expanduser().resolve())
+    index = SqliteSessionIndex(args.index.expanduser().resolve())
+    count = await index.rebuild(store)
+    print(f"indexed_sessions={count} index={index.path}")
+    return 0
+
+
+async def _search_persisted_sessions(args: argparse.Namespace) -> int:
+    """查询 SQLite 派生索引并逐行输出 JSON 命中。"""
+
+    index = SqliteSessionIndex(args.index.expanduser().resolve())
+    session_id = SessionId(args.session_id) if args.session_id else None
+    hits = index.search(args.query, limit=args.limit, session_id=session_id)
+    for hit in hits:
+        print(hit.model_dump_json())
     return 0
 
 
@@ -631,6 +737,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(_export_persisted_transcript(args))
         if args.command == "repair":
             return asyncio.run(_repair_persisted_session(args))
+        if args.command == "fork":
+            return asyncio.run(_fork_persisted_session(args))
+        if args.command == "compact":
+            return asyncio.run(_compact_persisted_session(args))
+        if args.command == "index-sessions":
+            return asyncio.run(_index_persisted_sessions(args))
+        if args.command == "search-sessions":
+            return asyncio.run(_search_persisted_sessions(args))
         if args.command == "chat":
             return asyncio.run(_chat(args))
         return asyncio.run(_run(args))

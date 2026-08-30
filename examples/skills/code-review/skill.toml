@@ -1,0 +1,4 @@
+name = "code-review"
+description = "Review Python changes for correctness, safety, and missing tests"
+instructions_file = "SKILL.md"
+allowed_tools = ["read_file", "search_text"]

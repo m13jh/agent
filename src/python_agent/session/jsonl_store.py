@@ -116,8 +116,8 @@ class JsonlSessionStore:
             update={
                 "id": target_id,
                 "created_at": utc_now(),
-                # 记录分支来源，便于审计；fork 后的 events 是独立副本，后续追加互不影响。
-                "parent_session_id": source.id,
+                # fork lineage 与子 Agent parent 分开记录，避免分支被生命周期管理器误认成 child。
+                "forked_from_session_id": source.id,
             }
         )
         return self._create_sync(target_header, tuple(source.events))
