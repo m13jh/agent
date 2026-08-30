@@ -131,6 +131,13 @@ python-agent run "检查项目构建" \
 预览、总长度和文件路径。应用层也可以传入自己的 `ApprovalService`、Pre/Execute/Post
 策略或 `spill_directory`。
 
+文件工具默认拒绝 `.env`、私钥、云凭据目录等敏感路径，并隐藏当前 SessionStore 根目录，
+防止模型读取凭据或把自己的 JSONL 历史重新搜索进上下文。真实 `.env` 仍应设为 0600：
+
+```bash
+chmod 600 .env
+```
+
 CLI 会实时显示模型文本增量、工具调用和工具结果。DeepSeek 使用 SSE 流式接口；Fake
 Adapter 也会切分文本，用于离线验证同样的显示流程。
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from python_agent.tools.builtins._paths import safe_path
+from python_agent.tools.builtins._paths import safe_path, should_hide_path
 from python_agent.tools.types import ToolContext
 
 
@@ -53,7 +53,10 @@ class ListFilesTool:
         if not root.is_dir():
             return paths
         for path in sorted(root.rglob("*")):
-            if any(part in self._ignored for part in path.parts):
+            relative_parts = path.relative_to(root).parts
+            if any(part in self._ignored for part in relative_parts) or should_hide_path(
+                path, context
+            ):
                 continue
             if path.is_file():
                 paths.append(path.relative_to(root).as_posix())

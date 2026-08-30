@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -38,6 +39,11 @@ class SqliteSessionIndex:
         """创建数据库目录、启用外键，并初始化稳定 schema。"""
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(descriptor)
+        else:
+            self.path.chmod(0o600)
         connection = sqlite3.connect(self.path)
         connection.execute("PRAGMA foreign_keys = ON")
         connection.executescript(
@@ -68,7 +74,19 @@ class SqliteSessionIndex:
                 ON searchable_events(event_type);
             """
         )
+        self._secure_sidecars()
         return connection
+
+    def _secure_sidecars(self) -> None:
+        """把数据库及可能出现的 WAL/SHM 文件权限统一收紧为 0600。"""
+
+        for path in (
+            self.path,
+            self.path.with_name(self.path.name + "-wal"),
+            self.path.with_name(self.path.name + "-shm"),
+        ):
+            if path.exists():
+                path.chmod(0o600)
 
     @staticmethod
     def _searchable(event: SessionEvent) -> tuple[str | None, str] | None:
@@ -156,6 +174,7 @@ class SqliteSessionIndex:
 
         with closing(self._connect()) as connection, connection:
             self._insert_session(connection, session)
+        self._secure_sidecars()
 
     async def rebuild(self, store: SessionStore) -> int:
         """严格加载所有 JSONL Session，并在一个事务中重建完整索引。"""
@@ -167,6 +186,7 @@ class SqliteSessionIndex:
             connection.execute("DELETE FROM sessions")
             for session in sessions:
                 self._insert_session(connection, session)
+        self._secure_sidecars()
         return len(sessions)
 
     @staticmethod

@@ -89,6 +89,7 @@ class AgentLoop:
         session: Session | None = None,
         system_prompt: str | None = None,
         workspace: Path | None = None,
+        excluded_paths: tuple[Path, ...] = (),
         event_handler: EventHandler | None = None,
         approval_service: ApprovalService | None = None,
         approval_required: set[str] | frozenset[str] | None = None,
@@ -113,6 +114,7 @@ class AgentLoop:
         )
         self.prompt_assembler = PromptAssembler.default()
         self.system_prompt = system_prompt or self.prompt_assembler.assemble()
+        self.excluded_paths = tuple(path.expanduser().resolve() for path in excluded_paths)
         self.cancel_event = asyncio.Event()
         self._runtime = ToolRuntime(
             self.tools,
@@ -663,6 +665,7 @@ class AgentLoop:
                         workspace=self.session.header.cwd,
                         cancel_event=self.cancel_event,
                         permission_mode=self.config.permission_mode,
+                        excluded_paths=self.excluded_paths,
                     )
                     tool_violation = usage_violation
                     if tool_violation is not None:

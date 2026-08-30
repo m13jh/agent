@@ -52,12 +52,16 @@ class DefaultModelRetryPolicy:
         "status 400",
         "status 401",
         "status 403",
+        "llm_http_400",
+        "llm_http_401",
+        "llm_http_403",
     )
     _malformed_markers = (
         "invalid deepseek response",
         "invalid deepseek stream",
         "invalid deepseek stream tool",
         "malformed",
+        "llm_malformed_response",
     )
 
     def __init__(self, base_delay_seconds: float = 0.5, *, max_delay_seconds: float = 30.0) -> None:

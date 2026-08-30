@@ -26,12 +26,19 @@
 ~~~text
 ruff：通过
 mypy：通过
-pytest：69 passed
+pytest：79 passed
 ~~~
 
 以下功能属于架构文档后续阶段，本文不把它们误记为当前缺陷：
 
 - 阶段 7 未选择项：远程 Subagent Provider、Code Mode、LSP、PTY、OS 沙箱、Web/RPC UI。
+
+### 1.1 2026-08-30 全功能审计修复
+
+本轮新增并验证：敏感凭据路径拒绝、SessionStore 动态排除、完整工具参数范围/items 校验、
+search_text 全局结果上限、repair/SQLite 0600 权限、subagent wait 通知同步、严格 SSE DONE
+检查、length 时丢弃工具调用、结构化 HTTP/流错误、Bash 自主管理超时，以及 CMake 样本
+标准差测试修正。OpenTelemetry 共享环境也已统一为 CrewAI 兼容的 1.42.1。
 
 ## 2. 已发生的问题：流式工具参数不完整
 
@@ -161,6 +168,11 @@ deepseek-harness/packages/llm/llm-retry/src/index.ts
 
 ### P0-2：显式处理不完整响应
 
+当前已实现 `LLM_STREAM_CLOSED`、`LLM_MALFORMED_RESPONSE`、`LLM_TRANSPORT_ERROR` 和
+`LLM_HTTP_<status>`，并强制要求 `[DONE]`；`finish_reason=length` 时会丢弃所有累积工具
+调用，确保半截参数不进入 Runtime。剩余工作是独立 BlockAssembler、Provider request id
+以及更完整的多行 SSE parser。
+
 需要区分：
 
 ~~~text
@@ -209,9 +221,9 @@ context_window：输入 + 输出的总上下文容量
 
 ### P0-4：增加模型请求错误恢复策略
 
-阶段 5 已完成通用部分：`request/error`、`request/retry`、可注入异步策略、有限指数退避、
-墙钟预算与取消协同均已实现。这里剩余的是把 P0-1/P0-2 的结构化 SSE 错误码接入策略，
-从而精确区分缺少 DONE、max_tokens、畸形工具参数和普通传输错误。
+阶段 5 已完成 `request/error`、`request/retry`、可注入异步策略、有限指数退避、墙钟预算
+与取消协同；结构化 SSE/HTTP 错误也已接入默认永久/临时错误判断。这里剩余的是支持
+Retry-After、Provider request id，以及 max_tokens 后自动拆分而不是只安全终止。
 
 建议流程：
 
@@ -249,6 +261,9 @@ request/error 结构化事件
 ## 5. P1：上下文和工具协议
 
 ### P1-1：减少目录扫描噪声
+
+已完成：默认缓存目录、`.python-agent`、敏感凭据文件和动态 SessionStore 根都会从
+list/search 中排除。该条保留用于后续按字节/项目数量治理。
 
 当前 list_files 还应默认忽略：
 
@@ -320,10 +335,8 @@ stdout/stderr 写入临时文件
 超时或取消时终止整个进程组
 ~~~
 
-这解决了当前环境下的重复执行问题，并通过了连续 Bash smoke test。后续仍需补充：
+这解决了当前环境下的重复执行问题，并通过了连续 Bash、超时和进程组回收测试。后续仍需补充：
 
-- 长时间命令超时测试；
-- 子进程树回收测试；
 - 取消中 Bash 的进程组回收测试；
 - stdout/stderr 超长 spill 测试；
 - Windows/WSL 行为差异测试。

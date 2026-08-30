@@ -128,6 +128,24 @@ async def test_bash_requires_approval_before_execution(tmp_path: Path) -> None:
     assert approved.content["stdout"] == "stage3"
 
 
+async def test_bash_uses_own_timeout_and_returns_actionable_error(tmp_path: Path) -> None:
+    """验证 Bash 先回收进程组，再返回包含实际秒数的领域错误。"""
+
+    tool = BashTool()
+    tool.timeout_seconds = 0.05
+    runtime = ToolRuntime(
+        ToolRegistry([tool]),
+        approval_service=CallbackApprovalService(lambda request: True),
+    )
+    result = await runtime.execute(
+        ToolCall(id="timeout", name="bash", arguments={"command": "sleep 10 & wait"}),
+        _context(tmp_path, writable=True),
+    )
+
+    assert result.is_error is True
+    assert "bash timed out after 0.05 seconds" in str(result.content)
+
+
 async def test_tool_timeout_becomes_error_result(tmp_path: Path) -> None:
     """验证超时会变成 is_error 结果，而不是泄漏未处理异常。"""
 

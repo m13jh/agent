@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from python_agent.config import AgentPreset
 from python_agent.core.agent import Agent
 from python_agent.core.lifecycle import CancelCause
-from python_agent.errors import SubagentLimitError, SubagentPermissionError
+from python_agent.errors import SubagentError, SubagentLimitError, SubagentPermissionError
 from python_agent.ids import MessageId, SessionId
 from python_agent.llm.adapter import ModelRouter
 from python_agent.session.events import utc_now
@@ -38,7 +38,9 @@ class _SubagentRecord:
     submitted_generation: int = 0
     notified_generation: int = 0
     work_event: asyncio.Event = field(default_factory=asyncio.Event)
+    notification_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     watcher: asyncio.Task[None] | None = None
+    notification_error: Exception | None = None
     interrupted: bool = False
     disposed: bool = False
     last_answer: str | None = None
@@ -258,24 +260,28 @@ class SubagentManager:
         """等待直接 child 当前批次收敛，并返回最新结果。"""
 
         record = self._owned_record(parent, child_id)
+        target_generation = record.submitted_generation
         await record.child.when_idle()
-        result = record.child.last_result
-        settled = SubagentSettled(
+        async with record.notification_condition:
+            await record.notification_condition.wait_for(
+                lambda: (
+                    record.notified_generation >= target_generation
+                    or record.notification_error is not None
+                    or record.disposed
+                )
+            )
+        if record.notification_error is not None:
+            raise SubagentError(
+                f"subagent settlement notification failed: {record.notification_error}"
+            ) from record.notification_error
+        if record.disposed and record.notified_generation < target_generation:
+            raise SubagentError("subagent was disposed before settlement notification")
+        return SubagentSettled(
             child_id=record.child.id,
             parent_id=record.parent_id,
-            answer=result.answer if result is not None else "",
-            finish_reason=(
-                "interrupted"
-                if record.interrupted
-                else result.finish_reason
-                if result is not None
-                else "idle"
-            ),
+            answer=record.last_answer or "",
+            finish_reason=record.finish_reason or "idle",
         )
-        # wait 是公开同步边界，即使 watcher 尚未获得调度，也应让 list_children 立刻看到结果。
-        record.last_answer = settled.answer
-        record.finish_reason = settled.finish_reason
-        return settled
 
     async def list_children(self, parent_id: SessionId) -> list[SubagentInfo]:
         """返回指定父级的直接孩子快照，不递归混入后代。"""
@@ -328,7 +334,6 @@ class SubagentManager:
                 )
                 record.last_answer = answer
                 record.finish_reason = reason
-                record.notified_generation = generation
                 settled = SubagentSettled(
                     child_id=record.child.id,
                     parent_id=record.parent_id,
@@ -348,12 +353,18 @@ class SubagentManager:
                         )
                     except RuntimeError:
                         pass
+                async with record.notification_condition:
+                    record.notified_generation = generation
+                    record.notification_condition.notify_all()
                 # followup 可能在通知过程中进入；重新置位可确保下一批不会错过 watcher。
                 if record.submitted_generation > generation:
                     record.work_event.set()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            async with record.notification_condition:
+                record.notification_error = exc
+                record.notification_condition.notify_all()
             await self.agent_manager.event_bus.emit(
                 "subagent/error",
                 {
@@ -380,6 +391,8 @@ class SubagentManager:
         if record.disposed:
             return
         record.disposed = True
+        async with record.notification_condition:
+            record.notification_condition.notify_all()
         if record.watcher is not None and record.watcher is not asyncio.current_task():
             record.watcher.cancel()
             await asyncio.gather(record.watcher, return_exceptions=True)
@@ -400,6 +413,8 @@ class SubagentManager:
         if record is None:
             return
         record.disposed = True
+        async with record.notification_condition:
+            record.notification_condition.notify_all()
         if record.watcher is not None and record.watcher is not asyncio.current_task():
             record.watcher.cancel()
             await asyncio.gather(record.watcher, return_exceptions=True)

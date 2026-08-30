@@ -54,6 +54,8 @@ async def test_child_has_independent_persisted_session_and_filtered_tools(tmp_pa
         SubagentSpec(description="只允许 echo", allowed_tools={"echo"}),
     )
     first = await manager.subagents.wait(parent, child_id)
+    assert settled_event.is_set()
+    assert len(parent.inbox.pending("next_step")) == 1
     await asyncio.wait_for(settled_event.wait(), timeout=1)
     child = manager.get(child_id)
 
@@ -72,6 +74,8 @@ async def test_child_has_independent_persisted_session_and_filtered_tools(tmp_pa
     settled_event.clear()
     await manager.subagents.followup(parent, child_id, "第二轮子任务")
     second = await manager.subagents.wait(parent, child_id)
+    assert settled_event.is_set()
+    assert len(parent.inbox.pending("next_step")) == 2
     await asyncio.wait_for(settled_event.wait(), timeout=1)
 
     assert second.answer == "Echo: 第二轮子任务"

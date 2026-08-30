@@ -96,6 +96,7 @@ class DeepSeekAdapter:
         base_url: str | None = None,
         timeout_seconds: float | None = None,
         env_file: Path | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         """解析配置、保存连接参数，并在缺少 API Key 时 fail closed。"""
 
@@ -105,6 +106,7 @@ class DeepSeekAdapter:
         configured_url = base_url or os.getenv("DEEPSEEK_BASE_URL") or DEFAULT_BASE_URL
         self.base_url = configured_url.strip().rstrip("/")
         self.timeout_seconds = _configured_timeout(timeout_seconds)
+        self.transport = transport
         if not self.api_key:
             raise ModelError("DEEPSEEK_API_KEY is required for the deepseek provider")
 
@@ -168,9 +170,15 @@ class DeepSeekAdapter:
         call_parts: dict[int, dict[str, str]] = {}
         finish_reason: Literal["stop", "tool_calls", "length", "error"] = "stop"
         usage: Usage | None = None
+        received_done = False
+        received_finish_reason = False
+        received_event_count = 0
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            async with httpx.AsyncClient(
+                timeout=self.timeout_seconds,
+                transport=self.transport,
+            ) as client:
                 async with client.stream(
                     "POST",
                     f"{self.base_url}/chat/completions",
@@ -185,7 +193,9 @@ class DeepSeekAdapter:
                             continue
                         data = line.removeprefix("data:").strip()
                         if data == "[DONE]":
+                            received_done = True
                             break
+                        received_event_count += 1
                         raw_event = json.loads(data)
                         if not isinstance(raw_event, Mapping):
                             raise ModelError("invalid DeepSeek stream event: expected an object")
@@ -212,17 +222,41 @@ class DeepSeekAdapter:
                         raw_reason = choice.get("finish_reason")
                         if raw_reason in {"stop", "tool_calls", "length", "error"}:
                             finish_reason = raw_reason
+                            received_finish_reason = True
                         raw_usage = raw_event.get("usage")
                         if isinstance(raw_usage, Mapping):
                             usage = Usage.model_validate(raw_usage)
         except asyncio.CancelledError:
             raise
-        except (httpx.HTTPError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise ModelError(f"DeepSeek streaming request failed: {exc}") from exc
+        except ModelError:
+            raise
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            raise ModelError(f"LLM_HTTP_{status}: DeepSeek request failed") from exc
+        except httpx.HTTPError as exc:
+            raise ModelError(f"LLM_TRANSPORT_ERROR: {exc}") from exc
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ModelError(f"LLM_MALFORMED_RESPONSE: {exc}") from exc
 
-        calls = [
-            self._finish_stream_call(index, parts) for index, parts in sorted(call_parts.items())
-        ]
+        if not received_done:
+            raise ModelError(
+                "LLM_STREAM_CLOSED: DeepSeek stream ended without [DONE] "
+                f"after {received_event_count} events"
+            )
+        if not received_finish_reason:
+            raise ModelError("LLM_MALFORMED_RESPONSE: stream has no finish_reason")
+        if finish_reason == "error":
+            raise ModelError("LLM_PROVIDER_ERROR: provider returned finish_reason=error")
+
+        # length 表示输出预算耗尽，累积的工具 JSON 可能只是一段合法前缀；绝不交给 Runtime。
+        calls = (
+            []
+            if finish_reason == "length"
+            else [
+                self._finish_stream_call(index, parts)
+                for index, parts in sorted(call_parts.items())
+            ]
+        )
         yield ModelChunk(
             tool_calls=calls,
             finish_reason=finish_reason,
@@ -268,16 +302,16 @@ class DeepSeekAdapter:
         """把累积的工具调用片段解析为可执行的完整 ToolCall。"""
 
         if not parts["id"] or not parts["name"]:
-            raise ModelError(f"invalid DeepSeek stream tool call at index {index}")
+            raise ModelError(f"LLM_MALFORMED_RESPONSE: incomplete tool call at index {index}")
         try:
             arguments = json.loads(parts["arguments"] or "{}")
         except json.JSONDecodeError as exc:
             raise ModelError(
-                f"invalid DeepSeek stream tool arguments at index {index}: {exc}"
+                f"LLM_MALFORMED_RESPONSE: invalid tool arguments at index {index}: {exc}"
             ) from exc
         if not isinstance(arguments, dict):
             raise ModelError(
-                f"invalid DeepSeek stream tool arguments at index {index}: expected an object"
+                f"LLM_MALFORMED_RESPONSE: tool arguments at index {index} must be an object"
             )
         return ToolCall(id=CallId(parts["id"]), name=parts["name"], arguments=arguments)
 
@@ -296,10 +330,14 @@ class DeepSeekAdapter:
         try:
             with urlopen(request, timeout=self.timeout_seconds) as response:
                 value = json.loads(response.read().decode("utf-8"))
-        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
-            raise ModelError(f"DeepSeek request failed: {exc}") from exc
+        except HTTPError as exc:
+            raise ModelError(f"LLM_HTTP_{exc.code}: DeepSeek request failed") from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise ModelError(f"LLM_TRANSPORT_ERROR: {exc}") from exc
+        except ValueError as exc:
+            raise ModelError(f"LLM_MALFORMED_RESPONSE: {exc}") from exc
         if not isinstance(value, Mapping):
-            raise ModelError("DeepSeek response must be a JSON object")
+            raise ModelError("LLM_MALFORMED_RESPONSE: response must be a JSON object")
         return value
 
     @staticmethod
@@ -374,4 +412,4 @@ class DeepSeekAdapter:
                 usage=usage,
             )
         except (KeyError, IndexError, TypeError, ValueError) as exc:
-            raise ModelError(f"invalid DeepSeek response: {exc}") from exc
+            raise ModelError(f"LLM_MALFORMED_RESPONSE: {exc}") from exc

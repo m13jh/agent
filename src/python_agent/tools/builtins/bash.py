@@ -37,6 +37,7 @@ class BashTool:
         "additionalProperties": False,
     }
     timeout_seconds: float | None = 60.0
+    handles_own_timeout = True
 
     def is_concurrency_safe(self, arguments: dict[str, Any]) -> bool:
         """Shell 可能读写任意 workspace 状态，默认不允许与其他工具重叠。"""

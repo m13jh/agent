@@ -149,7 +149,8 @@ def repair_jsonl_tail(path: Path, *, create_backup: bool = True) -> JsonlTailRep
     if create_backup:
         backup_path = _next_backup_path(resolved)
         try:
-            with backup_path.open("xb") as backup:
+            descriptor = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as backup:
                 backup.write(original)
                 backup.flush()
                 os.fsync(backup.fileno())

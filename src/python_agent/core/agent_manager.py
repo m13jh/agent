@@ -52,6 +52,17 @@ class AgentManager:
             raise ConfigurationError(f"agent preset already registered: {preset.id}")
         self._presets[preset.id] = preset
 
+    def _infrastructure_exclusions(self, explicit: tuple[Path, ...]) -> tuple[Path, ...]:
+        """合并调用方排除项和 Store 根目录，供文件工具避免读取自身日志。"""
+
+        paths = [path.expanduser().resolve() for path in explicit]
+        store_root = getattr(self.session_store, "root", None)
+        if isinstance(store_root, Path):
+            resolved = store_root.expanduser().resolve()
+            if resolved not in paths:
+                paths.append(resolved)
+        return tuple(paths)
+
     async def create(
         self,
         adapter: ModelAdapter | ModelRouter,
@@ -61,6 +72,7 @@ class AgentManager:
         session: Session | None = None,
         system_prompt: str | None = None,
         workspace: Path | None = None,
+        excluded_paths: tuple[Path, ...] = (),
         approval_service: ApprovalService | None = None,
         approval_required: set[str] | frozenset[str] | None = None,
         spill_directory: Path | None = None,
@@ -101,6 +113,7 @@ class AgentManager:
             session=session,
             system_prompt=system_prompt,
             workspace=workspace,
+            excluded_paths=self._infrastructure_exclusions(excluded_paths),
             event_bus=self.event_bus,
             approval_service=approval_service,
             approval_required=approval_required,
@@ -139,6 +152,7 @@ class AgentManager:
         session: Session | None = None,
         system_prompt: str | None = None,
         workspace: Path | None = None,
+        excluded_paths: tuple[Path, ...] = (),
         approval_service: ApprovalService | None = None,
         approval_required: set[str] | frozenset[str] | None = None,
         spill_directory: Path | None = None,
@@ -156,6 +170,7 @@ class AgentManager:
             session=session,
             system_prompt=system_prompt,
             workspace=workspace,
+            excluded_paths=excluded_paths,
             approval_service=approval_service,
             approval_required=approval_required,
             spill_directory=spill_directory,
@@ -199,6 +214,7 @@ class AgentManager:
         config: AgentPreset | None = None,
         repair: bool = False,
         system_prompt: str | None = None,
+        excluded_paths: tuple[Path, ...] = (),
         approval_service: ApprovalService | None = None,
         approval_required: set[str] | frozenset[str] | None = None,
         spill_directory: Path | None = None,
@@ -226,6 +242,7 @@ class AgentManager:
             system_prompt=system_prompt,
             # workspace 必须来自持久化 Header，不能由恢复调用悄悄扩大。
             workspace=session.header.cwd,
+            excluded_paths=self._infrastructure_exclusions(excluded_paths),
             event_bus=self.event_bus,
             approval_service=approval_service,
             approval_required=approval_required,

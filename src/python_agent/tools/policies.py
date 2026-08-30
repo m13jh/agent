@@ -65,38 +65,98 @@ def _matches_type(value: Any, expected: str) -> bool:
 
 
 def validate_arguments(tool: ToolDefinition, arguments: dict[str, Any]) -> None:
-    """校验阶段 3工具使用的精简 JSON Schema。
+    """递归校验工具实际使用的 JSON Schema 关键字。
 
-    当前支持 object、required、properties、additionalProperties 和基础 type；这些校验
-    会在工具主体之前执行，保证越界路径、缺少参数和错误类型不会先触发副作用。
+    外部模型参数在任何路径解析或副作用之前经过类型、范围、长度、枚举、数组 items、
+    object required/properties 和 additionalProperties 校验。未知注释关键字仍可保留，
+    但已声明的约束绝不能只展示给模型而不在运行时执行。
     """
 
     schema = tool.parameters
-    if schema.get("type", "object") != "object":
+    if not isinstance(schema, dict) or schema.get("type", "object") != "object":
         raise ToolValidationError(f"tool {tool.name} parameters must describe an object")
-    properties = schema.get("properties", {})
-    required = schema.get("required", [])
-    if not isinstance(properties, dict) or not isinstance(required, list):
-        raise ToolValidationError(f"tool {tool.name} has an invalid parameter schema")
-    missing = [name for name in required if name not in arguments]
-    if missing:
-        raise ToolValidationError(
-            f"tool {tool.name} is missing required arguments: {', '.join(missing)}"
-        )
-    if schema.get("additionalProperties", True) is False:
-        unknown = sorted(set(arguments) - set(properties))
-        if unknown:
-            raise ToolValidationError(
-                f"tool {tool.name} received unknown arguments: {', '.join(unknown)}"
-            )
-    for name, value in arguments.items():
-        spec = properties.get(name)
+    _validate_schema_value(arguments, schema, path=f"arguments for {tool.name}")
+
+
+def _validate_schema_value(value: Any, schema: dict[str, Any], *, path: str) -> None:
+    """校验一个 JSON 值及其递归子结构。"""
+
+    expected = schema.get("type")
+    if isinstance(expected, str) and not _matches_type(value, expected):
+        raise ToolValidationError(f"{path} must be {expected}")
+    enum = schema.get("enum")
+    if isinstance(enum, list) and value not in enum:
+        raise ToolValidationError(f"{path} must be one of {enum!r}")
+    if "const" in schema and value != schema["const"]:
+        raise ToolValidationError(f"{path} must equal {schema['const']!r}")
+
+    if isinstance(value, dict):
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
         if (
-            isinstance(spec, dict)
-            and isinstance(spec.get("type"), str)
-            and not _matches_type(value, spec["type"])
+            not isinstance(properties, dict)
+            or not isinstance(required, list)
+            or not all(isinstance(name, str) for name in required)
         ):
-            raise ToolValidationError(f"argument {name!r} for {tool.name} must be {spec['type']}")
+            raise ToolValidationError(f"{path} has an invalid object schema")
+        missing = [name for name in required if name not in value]
+        if missing:
+            raise ToolValidationError(f"{path} is missing required fields: {', '.join(missing)}")
+        additional = schema.get("additionalProperties", True)
+        unknown = sorted(set(value) - set(properties))
+        if additional is False and unknown:
+            raise ToolValidationError(f"{path} has unknown fields: {', '.join(unknown)}")
+        for name, item in value.items():
+            child_schema = properties.get(name)
+            if isinstance(child_schema, dict):
+                _validate_schema_value(item, child_schema, path=f"{path}.{name}")
+            elif isinstance(additional, dict):
+                _validate_schema_value(item, additional, path=f"{path}.{name}")
+        return
+
+    if isinstance(value, list):
+        minimum_items = schema.get("minItems")
+        maximum_items = schema.get("maxItems")
+        if isinstance(minimum_items, int) and len(value) < minimum_items:
+            raise ToolValidationError(f"{path} must contain at least {minimum_items} items")
+        if isinstance(maximum_items, int) and len(value) > maximum_items:
+            raise ToolValidationError(f"{path} must contain at most {maximum_items} items")
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                _validate_schema_value(item, item_schema, path=f"{path}[{index}]")
+        return
+
+    if isinstance(value, str):
+        minimum_length = schema.get("minLength")
+        maximum_length = schema.get("maxLength")
+        if isinstance(minimum_length, int) and len(value) < minimum_length:
+            raise ToolValidationError(f"{path} must have length >= {minimum_length}")
+        if isinstance(maximum_length, int) and len(value) > maximum_length:
+            raise ToolValidationError(f"{path} must have length <= {maximum_length}")
+        pattern = schema.get("pattern")
+        if isinstance(pattern, str):
+            try:
+                matched = re.search(pattern, value)
+            except re.error as exc:
+                raise ToolValidationError(f"{path} has invalid schema pattern: {exc}") from exc
+            if matched is None:
+                raise ToolValidationError(f"{path} does not match required pattern")
+        return
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        exclusive_minimum = schema.get("exclusiveMinimum")
+        exclusive_maximum = schema.get("exclusiveMaximum")
+        if isinstance(minimum, (int, float)) and value < minimum:
+            raise ToolValidationError(f"{path} must be >= {minimum}")
+        if isinstance(maximum, (int, float)) and value > maximum:
+            raise ToolValidationError(f"{path} must be <= {maximum}")
+        if isinstance(exclusive_minimum, (int, float)) and value <= exclusive_minimum:
+            raise ToolValidationError(f"{path} must be > {exclusive_minimum}")
+        if isinstance(exclusive_maximum, (int, float)) and value >= exclusive_maximum:
+            raise ToolValidationError(f"{path} must be < {exclusive_maximum}")
 
 
 def _error(invocation: ToolInvocation, message: str) -> ToolResult:
@@ -231,6 +291,10 @@ class TimeoutPolicy:
     ) -> Any:
         """用工具定义的 timeout_seconds 包裹下一层，超时由 Runtime 规范化。"""
 
+        if getattr(invocation.tool, "handles_own_timeout", False):
+            # Bash 需要在自己的 deadline 中先终止整个进程组，再返回包含秒数的领域错误；
+            # 外层 wait_for 与它使用同一超时会抢先取消，退化成没有上下文的 TimeoutError。
+            return await next_handler(invocation)
         timeout = invocation.tool.timeout_seconds
         if timeout is None:
             return await next_handler(invocation)

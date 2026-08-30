@@ -34,6 +34,10 @@ class ToolContext:
         default="read-only",
         metadata={"description": "当前工具调用的文件和 Shell 权限模式"},
     )
+    excluded_paths: tuple[Path, ...] = field(
+        default=(),
+        metadata={"description": "基础设施或敏感数据目录；文件工具不得读取、列出或修改"},
+    )
     approval_service: Any = field(
         default=None,
         metadata={"description": "可选的高风险工具审批服务"},
