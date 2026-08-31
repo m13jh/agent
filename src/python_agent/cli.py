@@ -1,4 +1,4 @@
-"""阶段 1—4 Agent 的命令行入口。
+"""阶段 1—7 Agent 的 Codex 风格交互入口与兼容管理命令。
 
 ``run`` 负责一次性任务，``chat`` 负责长期交互。两者共享同一套 AgentManager、工具
 注册表、权限配置和 Live Event Bus，因此命令行只是接入层，不重复实现 Agent 逻辑。
@@ -12,11 +12,13 @@ import json
 import os
 import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 
@@ -36,6 +38,7 @@ from python_agent.session.jsonl_store import JsonlSessionStore
 from python_agent.session.sqlite_index import SqliteSessionIndex
 from python_agent.skills.registry import SkillRegistry
 from python_agent.skills.tool import ListSkillsTool, LoadSkillTool
+from python_agent.terminal_ui import FullScreenTerminalUI, TerminalUI
 from python_agent.tools.builtins import (
     ApplyPatchTool,
     BashTool,
@@ -46,6 +49,8 @@ from python_agent.tools.builtins import (
     WriteFileTool,
 )
 from python_agent.tools.registry import ToolRegistry
+
+LiveHandler = Callable[[str, dict[str, Any]], None | Awaitable[None]]
 
 
 def _display_event(event_type: str, data: dict[str, Any]) -> None:
@@ -268,6 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
     """创建 CLI 参数解析器；子命令解析结果最终交给异步运行函数。"""
 
     parser = argparse.ArgumentParser(prog="python-agent", description="Run a small Python agent")
+    parser.add_argument("--version", action="version", version="python-agent 0.1.0")
     subparsers = parser.add_subparsers(dest="command", required=True)
     run = subparsers.add_parser("run", help="run one user task")
     run.add_argument("prompt", help="the user task")
@@ -279,6 +285,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="offline demo: call read_file before answering",
     )
     chat = subparsers.add_parser("chat", help="start an interactive agent session")
+    chat.add_argument("prompt", nargs="?", help="optional initial task, then remain interactive")
+    chat.add_argument("--plain", action="store_true", help="disable full-screen terminal rendering")
     _add_agent_options(chat)
 
     sessions = subparsers.add_parser("sessions", help="list persisted Sessions")
@@ -330,7 +338,11 @@ def _session_root(value: Path | None, workspace: Path) -> Path:
     return value.expanduser().resolve() if value.is_absolute() else (workspace / value).resolve()
 
 
-async def _create_agent(args: argparse.Namespace) -> tuple[AgentManager, Agent]:
+async def _create_agent(
+    args: argparse.Namespace,
+    *,
+    event_handler: LiveHandler | None = None,
+) -> tuple[AgentManager, Agent]:
     """根据命令行参数创建 Manager、共享事件总线、工具集合和 Agent Handle。"""
 
     # CLI 统一注册全部阶段 1—3工具；能否执行写工具或 Bash，由后续的权限和审批策略决定。
@@ -409,7 +421,7 @@ async def _create_agent(args: argparse.Namespace) -> tuple[AgentManager, Agent]:
     )
     approval_service = CallbackApprovalService(_allow_explicit_bash) if args.approve_bash else None
     event_bus = LiveEventBus()
-    event_bus.subscribe("*", _display_event)
+    event_bus.subscribe("*", event_handler or _display_event)
     store = JsonlSessionStore(_session_root(args.session_root, workspace))
     manager = AgentManager(event_bus=event_bus, session_store=store)
     if args.resume:
@@ -563,9 +575,26 @@ async def _search_persisted_sessions(args: argparse.Namespace) -> int:
     return 0
 
 
-def _print_chat_help() -> None:
+def _chat_output(
+    ui: TerminalUI | None,
+    message: str,
+    *,
+    style: str = "dim",
+) -> None:
+    """把交互命令反馈路由到 Rich UI 或纯文本回退。"""
+
+    if ui is None:
+        print(message)
+    else:
+        ui.print_notice(message, style=style)
+
+
+def _print_chat_help(ui: TerminalUI | None = None) -> None:
     """显示交互式终端支持的特殊命令。"""
 
+    if ui is not None:
+        ui.show_help()
+        return
     print(
         """\n可用命令：
   /steer 内容       在下一步纠偏
@@ -574,6 +603,7 @@ def _print_chat_help() -> None:
   /cancel keep      取消当前执行但保留 Inbox
   /status           查看 Agent 状态和 Inbox
   /transcript       查看当前 Session transcript
+  /tools            展开或折叠工具参数、命令和结果
   /wait             等待当前任务回到 idle
   /exit             退出交互模式
 直接输入其他文本会调用 followup，开启一个新的 Turn。
@@ -584,6 +614,22 @@ Agent 运行中的 followup 会显示“已排队”，并在当前任务结束�
 
 
 _CHAT_PROMPT_PREFIX = re.compile(r"^(?:你>\s*)+")
+_CHAT_COMPLETER = WordCompleter(
+    [
+        "/help",
+        "/status",
+        "/transcript",
+        "/tools",
+        "/verbose",
+        "/wait",
+        "/cancel",
+        "/cancel keep",
+        "/steer",
+        "/inject",
+        "/exit",
+    ],
+    sentence=True,
+)
 
 
 def _normalize_chat_line(raw_line: str) -> tuple[str, int]:
@@ -602,7 +648,11 @@ def _normalize_chat_line(raw_line: str) -> tuple[str, int]:
     return stripped[matched.end() :].strip(), prefix.count("你>")
 
 
-async def _dispatch_chat_line(agent: Agent, raw_line: str) -> bool:
+async def _dispatch_chat_line(
+    agent: Agent,
+    raw_line: str,
+    ui: TerminalUI | None = None,
+) -> bool:
     """解析并执行一行交互输入；返回 True 表示调用方应退出 REPL。
 
     把命令分发从 prompt 读取循环中抽离后，提示符清理、排队反馈和状态展示都可以进行
@@ -612,36 +662,40 @@ async def _dispatch_chat_line(agent: Agent, raw_line: str) -> bool:
 
     line, removed_prompts = _normalize_chat_line(raw_line)
     if removed_prompts:
-        print(
+        _chat_output(
+            ui,
             f"[输入修正] 已移除 {removed_prompts} 个误复制的“你>”提示符；"
-            "以后只需输入提示符后面的内容。"
+            "以后只需输入提示符后面的内容。",
+            style="yellow",
         )
     if not line:
         return False
     if line in {"/exit", "/quit"}:
         return True
     if line == "/help":
-        _print_chat_help()
+        _print_chat_help(ui)
         return False
     if line == "/steer":
-        print("用法：/steer 内容")
+        _chat_output(ui, "用法：/steer 内容", style="yellow")
         return False
     if line.startswith("/steer "):
         was_running = agent.status == "running"
         await agent.steer(line.removeprefix("/steer ").strip())
         pending = len(agent.inbox.pending("next_step"))
         if was_running:
-            print(f"[已排队] steer 将在下一个 Step 生效；next_step 当前 {pending} 条。")
+            _chat_output(ui, f"[已排队] steer 将在下一个 Step 生效；next_step 当前 {pending} 条。")
         else:
-            print("[已提交] steer 已唤醒 Agent。")
+            _chat_output(ui, "[已提交] steer 已唤醒 Agent。", style="cyan")
         return False
     if line == "/inject":
-        print("用法：/inject 内容")
+        _chat_output(ui, "用法：/inject 内容", style="yellow")
         return False
     if line.startswith("/inject "):
         await agent.inject(line.removeprefix("/inject ").strip())
         pending = len(agent.inbox.pending("next_step"))
-        print(f"[已注入] 静默上下文已保存；next_step 当前 {pending} 条，不会单独唤醒 Agent。")
+        _chat_output(
+            ui, f"[已注入] 静默上下文已保存；next_step 当前 {pending} 条，不会单独唤醒 Agent。"
+        )
         return False
     if line == "/cancel" or line == "/cancel keep":
         keep_inbox = line == "/cancel keep"
@@ -651,11 +705,16 @@ async def _dispatch_chat_line(agent: Agent, raw_line: str) -> bool:
         )
         if keep_inbox:
             pending = len(agent.inbox.pending())
-            print(f"[已取消] 当前执行已停止，保留 {pending} 条 Inbox 消息。")
+            _chat_output(
+                ui, f"[已取消] 当前执行已停止，保留 {pending} 条 Inbox 消息。", style="yellow"
+            )
         else:
-            print("[已取消] 当前执行已停止，待处理 Inbox 已清空。")
+            _chat_output(ui, "[已取消] 当前执行已停止，待处理 Inbox 已清空。", style="yellow")
         return False
     if line == "/status":
+        if ui is not None:
+            ui.show_status(agent)
+            return False
         request = agent.active_request
         details = [
             f"状态：{agent.status}",
@@ -676,47 +735,91 @@ async def _dispatch_chat_line(agent: Agent, raw_line: str) -> bool:
         print("\n".join(details))
         return False
     if line == "/transcript":
-        print(agent.session.transcript() or "（当前没有 transcript）")
+        transcript = agent.session.transcript()
+        if ui is None:
+            print(transcript or "（当前没有 transcript）")
+        else:
+            ui.show_transcript(transcript)
+        return False
+    if line in {"/tools", "/verbose"}:
+        if ui is None:
+            _chat_output(ui, "工具详情切换只在全屏界面生效；去掉 --plain 后使用 /tools。")
+        else:
+            ui.toggle_tool_details()
         return False
     if line == "/wait":
         try:
             await agent.when_idle()
         except Exception as exc:
             # Agent/error 已由事件总线实时展示；这里保留 REPL，并给出 wait 的收敛结果。
-            print(f"[等待结束] Agent 因 {type(exc).__name__} 结束：{exc}")
+            _chat_output(ui, f"[等待结束] Agent 因 {type(exc).__name__} 结束：{exc}", style="red")
         else:
-            print("Agent 已回到 idle。")
+            _chat_output(ui, "Agent 已回到 idle。", style="green")
         return False
 
     was_running = agent.status == "running"
     await agent.followup(line)
     if was_running:
         pending = len(agent.inbox.pending("next_turn"))
-        print(f"[已排队] followup 已保存；next_turn 当前 {pending} 条，当前任务结束后处理。")
+        _chat_output(
+            ui, f"[已排队] followup 已保存；next_turn 当前 {pending} 条，当前任务结束后处理。"
+        )
     else:
-        print("[已提交] followup 已唤醒 Agent。")
+        _chat_output(ui, "[已提交] followup 已唤醒 Agent。", style="cyan")
     return False
 
 
 async def _chat(args: argparse.Namespace) -> int:
-    """运行类似 REPL 的交互终端，让输入和后台 Driver 同时推进。
+    """在真实 TTY 使用单 renderer 全屏 TUI，其他环境回退纯文本 REPL。"""
 
-    prompt_async 不会阻塞 Agent 的事件循环，因此模型运行时用户仍然可以输入 steer、
-    inject 或下一条 followup。patch_stdout 会在后台流式输出到达时重绘提示符，避免输出
-    直接覆盖正在编辑的命令行。
-    """
+    use_full_screen = not args.plain and sys.stdin.isatty() and sys.stdout.isatty()
+    if use_full_screen:
+        ui = FullScreenTerminalUI()
+        manager, agent = await _create_agent(args, event_handler=ui.handle_event)
+
+        async def dispatch(line: str) -> bool:
+            return await _dispatch_chat_line(agent, line, ui)
+
+        try:
+            await ui.run(agent, dispatch, initial_prompt=args.prompt)
+        finally:
+            if agent.status == "running":
+                await agent.cancel(CancelCause(kind="user", message="退出交互终端"))
+            await manager.shutdown()
+            ui.show_goodbye()
+        return 0
 
     manager, agent = await _create_agent(args)
-    prompt_session: PromptSession[str] = PromptSession(history=InMemoryHistory())
+    prompt_session: PromptSession[str] = PromptSession(
+        message="你> ",
+        history=InMemoryHistory(),
+        completer=_CHAT_COMPLETER,
+        auto_suggest=AutoSuggestFromHistory(),
+        complete_while_typing=False,
+    )
     print(f"python-agent 交互模式，Session：{agent.id}，输入 /help 查看命令。")
     try:
+        should_exit = False
+        if args.prompt:
+            print(f"你> {args.prompt}")
+            should_exit = await _dispatch_chat_line(agent, args.prompt)
         with patch_stdout():
-            while True:
+            while not should_exit:
                 try:
-                    raw_line = await prompt_session.prompt_async("你> ")
-                except (EOFError, KeyboardInterrupt):
-                    print("\n正在退出……")
+                    raw_line = await prompt_session.prompt_async()
+                except EOFError:
+                    print("正在退出……")
                     break
+                except KeyboardInterrupt:
+                    if agent.status == "running":
+                        await agent.cancel(
+                            CancelCause(kind="user", message="Ctrl-C 取消当前执行"),
+                            keep_inbox=False,
+                        )
+                        print("已取消当前执行。")
+                    else:
+                        print("输入 /exit 或按 Ctrl-D 退出。")
+                    continue
                 if await _dispatch_chat_line(agent, raw_line):
                     break
     finally:
@@ -726,10 +829,39 @@ async def _chat(args: argparse.Namespace) -> int:
     return 0
 
 
+_CLI_COMMANDS = {
+    "run",
+    "chat",
+    "sessions",
+    "transcript",
+    "repair",
+    "fork",
+    "compact",
+    "index-sessions",
+    "search-sessions",
+}
+
+
+def _normalize_cli_argv(argv: Sequence[str]) -> list[str]:
+    """把 Codex 风格无子命令调用改写成 chat，同时保留原管理命令。
+
+    ``python-agent``、``python-agent --provider ...`` 和 ``python-agent "任务"`` 都进入
+    交互终端；显式 run/chat 及 Session 管理子命令保持向后兼容。
+    """
+
+    values = list(argv)
+    if not values:
+        return ["chat"]
+    if values[0] in {"-h", "--help", "--version"} or values[0] in _CLI_COMMANDS:
+        return values
+    return ["chat", *values]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """同步 CLI 入口，负责选择子命令、启动事件循环和转换顶层异常。"""
 
-    args = build_parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(_normalize_cli_argv(raw_argv))
     try:
         if args.command == "sessions":
             return asyncio.run(_list_persisted_sessions(args))

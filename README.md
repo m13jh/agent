@@ -12,6 +12,57 @@
 python -m pip install -e '.[dev]'
 ```
 
+## Codex 风格交互终端
+
+无需子命令，直接启动就进入长期会话：
+
+```bash
+python-agent
+```
+
+也可以携带首个任务；回答完成后仍停留在终端中继续对话：
+
+```bash
+python-agent "检查当前项目并说明结构" --provider deepseek --model qwen3.7-flash
+```
+
+真实 TTY 默认使用单一 `prompt_toolkit` 全屏界面。启动品牌横幅属于历史内容，对话变长后
+会自然滚走，不占用固定头部；只有底部输入区和状态栏固定。空输入框高一行，发生换行时
+最多增长到五行。恢复 Session 时会从 JSONL 重新投影过去的用户消息、回答、工具调用、
+Bash 命令和结果。所有样式由同一个 renderer 输出，避免 Rich/ANSI 与输入重绘冲突。
+快捷键：
+
+```text
+Enter       提交
+Alt+Enter   输入换行
+PageUp/Down 滚动会话
+鼠标滚轮    每格直接滚动消息视口三行，不移动输入焦点
+Ctrl+Home   回到 Session 最早消息
+Ctrl+End    回到底部
+Ctrl+O      展开/折叠工具参数和输出
+Ctrl+C      清空输入或取消当前任务
+Ctrl+D      退出
+```
+
+向上浏览历史后，新事件不会强制把视图拉回底部；状态栏会显示当前位置和新更新数量。
+按 `Ctrl+End` 重新开启自动跟随。工具调用默认完全折叠，只保留工具名、参数/命令和状态；
+用鼠标点击某个工具标题可单独展开或收起，`Ctrl+O` 或 `/tools` 则切换全部工具。展开
+长工具结果时，滚动边界按自动折行后的真实屏幕高度计算，不会在结果中段提前停止。
+
+非 TTY 会自动回退纯文本，也可以显式使用：
+
+```bash
+python-agent --plain
+```
+
+原有自动化入口保持兼容：
+
+```bash
+python-agent run "一次性任务"
+python-agent chat
+python-agent sessions
+```
+
 ## 运行离线示例
 
 默认使用可控的 Fake Adapter，因此不需要 API Key：
@@ -138,16 +189,16 @@ python-agent run "检查项目构建" \
 chmod 600 .env
 ```
 
-CLI 会实时显示模型文本增量、工具调用和工具结果。DeepSeek 使用 SSE 流式接口；Fake
-Adapter 也会切分文本，用于离线验证同样的显示流程。
+CLI 会显示模型请求状态、工具调用和工具结果。全屏交互模式在完整消息边界把常用 Markdown
+转换成标题、列表和代码块；纯文本模式仍显示原始流式增量。DeepSeek 使用严格 SSE 接口。
 
 ## 交互式终端
 
-在真实终端中先激活 `agent` 环境，再启动 chat：
+在真实终端中先激活 `agent` 环境，然后直接启动：
 
 ```bash
 conda activate agent
-python-agent chat
+python-agent
 ```
 
 交互模式支持以下输入：
@@ -160,6 +211,7 @@ python-agent chat
 /cancel keep         → 取消但保留 Inbox
 /status              → 查看 Agent 和 Inbox 状态
 /transcript          → 查看当前 Session
+/tools               → 展开或折叠工具参数、命令和结果
 /wait                → 等待当前任务完成
 /exit                → 退出
 ```

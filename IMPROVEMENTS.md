@@ -26,7 +26,7 @@
 ~~~text
 ruff：通过
 mypy：通过
-pytest：79 passed
+pytest：92 passed
 ~~~
 
 以下功能属于架构文档后续阶段，本文不把它们误记为当前缺陷：
