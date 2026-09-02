@@ -7,10 +7,13 @@ import asyncio
 import pytest
 
 from python_agent.cli import _dispatch_chat_line, _display_event, _normalize_chat_line
+from python_agent.config import AgentPreset
 from python_agent.core.agent import Agent
 from python_agent.core.agent_loop import AgentLoop
 from python_agent.llm.fake_adapter import FakeAdapter
 from python_agent.llm.types import AssistantResponse, ModelRequest
+from python_agent.tools.builtins import EchoTool
+from python_agent.tools.registry import ToolRegistry
 
 
 @pytest.mark.parametrize(
@@ -47,6 +50,99 @@ async def test_copied_transcript_prompt_is_dispatched_as_local_command(capsys) -
     assert "（当前没有 transcript）" in output
     assert adapter.requests == []
     assert agent.status == "idle"
+    await agent.dispose()
+
+
+async def test_max_steps_pauses_agent_without_final_answer() -> None:
+    """达到 max_steps 后 Driver 虽回到 idle，但最近任务必须是 paused。"""
+
+    adapter = FakeAdapter(
+        [
+            {
+                "tool_calls": [{"id": "echo-1", "name": "echo", "arguments": {"value": "partial"}}],
+                "finish_reason": "tool_calls",
+            }
+        ]
+    )
+    agent = Agent(
+        adapter,
+        ToolRegistry([EchoTool()]),
+        config=AgentPreset(max_steps=1),
+    )
+    limits: list[dict] = []
+    agent.event_bus.subscribe("agent/limit", lambda kind, data: limits.append(data))
+
+    result = await agent.run("需要继续的任务")
+
+    assert agent.status == "idle"
+    assert agent.task_status == "paused"
+    assert result.task_status == "paused"
+    assert result.answer == ""
+    assert result.finish_reason == "max_steps"
+    assert limits[0]["reason"] == "max_steps"
+    assert "尚未生成最终回答" in limits[0]["message"]
+    await agent.dispose()
+
+
+async def test_continue_resumes_paused_task_and_completes(capsys) -> None:
+    """/continue 应沿用已有上下文继续任务，并在最终回答后变为 completed。"""
+
+    adapter = FakeAdapter(
+        [
+            {
+                "tool_calls": [{"id": "echo-1", "name": "echo", "arguments": {"value": "partial"}}],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "继续后的最终答案", "finish_reason": "stop"},
+        ]
+    )
+    agent = Agent(
+        adapter,
+        ToolRegistry([EchoTool()]),
+        config=AgentPreset(max_steps=1),
+    )
+
+    await agent.run("需要继续的任务")
+    await _dispatch_chat_line(agent, "/continue")
+    await agent.when_idle()
+
+    assert capsys.readouterr().out == "[已提交] 正在继续上一个尚未完成的任务。\n"
+    assert agent.status == "idle"
+    assert agent.task_status == "completed"
+    assert agent.last_result is not None
+    assert agent.last_result.answer == "继续后的最终答案"
+    assert len(adapter.requests) == 2
+    await agent.dispose()
+
+
+async def test_new_followup_warns_when_previous_task_was_paused(capsys) -> None:
+    """暂停后输入普通文本会开启新 Turn，但明确提示上一个任务未完成。"""
+
+    adapter = FakeAdapter(
+        [
+            {
+                "tool_calls": [{"id": "echo-1", "name": "echo", "arguments": {"value": "partial"}}],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "新任务答案", "finish_reason": "stop"},
+        ]
+    )
+    agent = Agent(
+        adapter,
+        ToolRegistry([EchoTool()]),
+        config=AgentPreset(max_steps=1),
+    )
+
+    await agent.run("第一个未完成任务")
+    await _dispatch_chat_line(agent, "另一个新任务")
+    output = capsys.readouterr().out
+
+    assert "上一个任务因执行限制暂停" in output
+    assert "尚未生成最终回答" in output
+    assert "/continue" in output
+    await agent.when_idle()
+    assert agent.last_result is not None
+    assert agent.last_result.answer == "新任务答案"
     await agent.dispose()
 
 

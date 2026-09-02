@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from python_agent.skills.registry import SkillRegistry
+from python_agent.tools.definition import ToolCapabilities
 from python_agent.tools.registry import ToolRegistry
 from python_agent.tools.types import ToolContext
 
@@ -16,6 +17,13 @@ class ListSkillsTool:
     description = "List available on-demand skills without loading their full instructions."
     parameters = {"type": "object", "properties": {}, "additionalProperties": False}
     timeout_seconds: float | None = 10.0
+    capabilities = ToolCapabilities(
+        read_only=True,
+        destructive=False,
+        open_world=False,
+        concurrency_safe=True,
+        requires_approval=False,
+    )
 
     def __init__(self, skills: SkillRegistry) -> None:
         self.skills = skills
@@ -44,6 +52,13 @@ class LoadSkillTool:
         "additionalProperties": False,
     }
     timeout_seconds: float | None = 10.0
+    capabilities = ToolCapabilities(
+        read_only=True,
+        destructive=False,
+        open_world=False,
+        concurrency_safe=True,
+        requires_approval=False,
+    )
 
     def __init__(self, skills: SkillRegistry, tools: ToolRegistry) -> None:
         self.skills = skills

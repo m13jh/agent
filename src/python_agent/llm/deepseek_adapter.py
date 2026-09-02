@@ -404,7 +404,7 @@ class DeepSeekAdapter:
             )
             reason = choice.get("finish_reason", "stop")
             if reason not in {"stop", "tool_calls", "length", "error"}:
-                reason = "stop"
+                raise ModelError(f"LLM_MALFORMED_RESPONSE: unknown finish_reason {reason!r}")
             return AssistantResponse(
                 content=content,
                 tool_calls=calls,

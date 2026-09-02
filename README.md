@@ -178,6 +178,10 @@ python-agent run "检查项目构建" \
   --approve-bash
 ```
 
+Bash 仍然会在 bubblewrap OS 沙箱中运行：workspace 挂载到隔离的 `/workspace`，临时目录
+使用独立 tmpfs，子进程环境只保留最小非敏感变量。无法创建网络命名空间的 WSL/容器环境
+会退化为受限本地命令白名单；找不到 bubblewrap 时直接拒绝执行，不会静默运行宿主机 Shell。
+
 超长工具结果会保存到 workspace 下的 `.python-agent/tool-output/`，模型上下文只收到
 预览、总长度和文件路径。应用层也可以传入自己的 `ApprovalService`、Pre/Execute/Post
 策略或 `spill_directory`。

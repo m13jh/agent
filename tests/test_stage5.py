@@ -14,10 +14,25 @@ from python_agent.ids import SessionId
 from python_agent.llm.fake_adapter import FakeAdapter
 from python_agent.llm.retry import ModelRetryContext, RetryDecision
 from python_agent.llm.types import AssistantResponse, ModelRequest, ToolCall
-from python_agent.tools.definition import FunctionTool
+from python_agent.tools.definition import FunctionTool, ToolCapabilities
 from python_agent.tools.registry import ToolRegistry
 from python_agent.tools.runtime import ToolRuntime
 from python_agent.tools.types import ToolContext
+
+_READ_ONLY_PARALLEL = ToolCapabilities(
+    read_only=True,
+    destructive=False,
+    open_world=False,
+    concurrency_safe=True,
+    requires_approval=False,
+)
+_READ_ONLY_EXCLUSIVE = ToolCapabilities(
+    read_only=True,
+    destructive=False,
+    open_world=False,
+    concurrency_safe=False,
+    requires_approval=False,
+)
 
 
 def _context(tmp_path: Path) -> ToolContext:
@@ -61,6 +76,7 @@ async def test_parallel_tools_overlap_but_results_keep_model_order(tmp_path: Pat
         },
         body=body,
         concurrency_safe=True,
+        capabilities=_READ_ONLY_PARALLEL,
     )
     calls = [
         ToolCall(id="first-call", name="parallel", arguments={"name": "first"}),
@@ -101,6 +117,7 @@ async def test_parallel_pool_is_bounded(tmp_path: Path) -> None:
         parameters={"type": "object"},
         body=body,
         concurrency_safe=True,
+        capabilities=_READ_ONLY_PARALLEL,
     )
     calls = [
         ToolCall(id=f"call-{index}", name="bounded", arguments={"index": index})
@@ -155,6 +172,7 @@ async def test_exclusive_tool_forms_barrier_between_parallel_batches(tmp_path: P
         parameters={"type": "object"},
         body=read_body,
         concurrency_safe=True,
+        capabilities=_READ_ONLY_PARALLEL,
     )
     write_tool = FunctionTool(
         name="write",
@@ -162,6 +180,7 @@ async def test_exclusive_tool_forms_barrier_between_parallel_batches(tmp_path: P
         parameters={"type": "object"},
         body=write_body,
         concurrency_safe=False,
+        capabilities=_READ_ONLY_EXCLUSIVE,
     )
     calls = [
         ToolCall(id="r1", name="read", arguments={"name": "r1"}),
@@ -201,6 +220,7 @@ async def test_parallel_group_cancellation_returns_one_result_per_call(tmp_path:
         parameters={"type": "object"},
         body=body,
         concurrency_safe=True,
+        capabilities=_READ_ONLY_PARALLEL,
     )
     calls = [ToolCall(id=f"c{index}", name="cancelled", arguments={}) for index in range(3)]
     context = _context(tmp_path)
@@ -236,6 +256,7 @@ async def test_agent_loop_cancellation_still_pairs_every_tool_call(tmp_path: Pat
         parameters={"type": "object"},
         body=body,
         concurrency_safe=True,
+        capabilities=_READ_ONLY_PARALLEL,
     )
     adapter = FakeAdapter(
         [
@@ -291,6 +312,7 @@ async def test_agent_loop_commits_parallel_results_in_model_order() -> None:
         parameters={"type": "object"},
         body=body,
         concurrency_safe=True,
+        capabilities=_READ_ONLY_PARALLEL,
     )
     adapter = FakeAdapter(
         [
@@ -332,6 +354,7 @@ async def test_token_budget_skips_tools_and_concludes_turn() -> None:
         description="must be skipped",
         parameters={"type": "object"},
         body=body,
+        capabilities=_READ_ONLY_EXCLUSIVE,
     )
     adapter = FakeAdapter(
         [
@@ -466,6 +489,7 @@ async def test_wall_time_budget_cancels_tool_group_without_poisoning_agent() -> 
         parameters={"type": "object"},
         body=body,
         concurrency_safe=True,
+        capabilities=_READ_ONLY_PARALLEL,
     )
     adapter = FakeAdapter(
         [

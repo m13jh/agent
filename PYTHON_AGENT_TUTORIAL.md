@@ -19,7 +19,7 @@
   → 下一次 ModelRequest
 ```
 
-最重要的设计决定有五个：
+最重要的设计决定有六个：
 
 1. **Session 事件日志是真相源。** `messages()`、transcript、SQLite 搜索索引和 TUI
    都是从事件派生的视图，不维护第二份模型历史。
@@ -31,9 +31,18 @@
    输出裁剪都位于业务工具之外。
 5. **所有异步资源都要有主人。** Driver、并发工具 Task、子 Agent watcher、Bash
    进程组都会由创建它们的对象取消并等待收敛。
+6. **Driver 生命周期和任务结果状态分离。** `idle` 只表示当前没有运行中的 Driver，
+   不代表最近任务已经完成；`task_status` 会区分 `completed`、`paused`、`cancelled` 和
+   `error`。
 
-本文已经逐行阅读当前 `src/python_agent` 下的 60 个 Python 文件；之后的“逐文件导读”
+本文已经逐行阅读当前 `src/python_agent` 下的 63 个 Python 文件；之后的“逐文件导读”
 按真实目录逐个说明。为了快速建立整体感觉，建议先读第 1～3 节，再回头查文件。
+
+> **当前实现状态（2026-09-01）**：P0 边界已经落地，包括通用流终止帧与 `length` 执行
+> 闸门、EventBus 观察者隔离、bubblewrap Bash containment、`FileTransaction` 文件事务、
+> ToolResult JSON-safe 归一化、ToolCapabilities fail-closed 默认、子 Agent 能力继承、
+> fork lineage 重置和同步 child 结果去重。下面涉及这些机制的章节均按当前源码说明；
+> `IMPROVEMENTS.md` 中的修复前复现仍作为历史背景保留。
 
 ---
 
@@ -81,6 +90,26 @@ python -m python_agent chat
 python -m python_agent run "检查项目结构" --provider deepseek --model deepseek-chat
 ```
 
+如果任务需要 Bash，必须显式打开写入权限和审批：
+
+```bash
+python -m python_agent run "检查 git 状态" \
+  --provider deepseek \
+  --permission-mode workspace-write \
+  --approve-bash
+```
+
+Bash 会在 bubblewrap 中运行。验证当前终端是否支持网络命名空间时，应把要执行的程序
+一并挂载：
+
+```bash
+bwrap --ro-bind / / --unshare-net -- /bin/true
+echo $?
+```
+
+不要只运行 `bwrap --unshare-net -- /bin/true` 后把失败当成网络隔离不支持；如果 `/bin`
+没有挂载，失败可能只是找不到被执行的程序。
+
 当前源码没有把 `max_tokens` 做成 CLI 参数，默认值来自 `AgentPreset.max_tokens=2048`；
 这是 `IMPROVEMENTS.md` 中仍列出的待改进点。
 
@@ -97,8 +126,8 @@ from python_agent.tools.registry import ToolRegistry
 async def main() -> None:
     agent = AgentLoop(FakeAdapter(), ToolRegistry([EchoTool()]))
     result = await agent.run("hello")
-    print(result.answer)                 # Echo: hello
-    print(result.session.transcript())   # 人类可读的事件投影
+    print(result.answer)  # Echo: hello
+    print(result.session.transcript())  # 人类可读的事件投影
 
 
 asyncio.run(main())
@@ -106,6 +135,43 @@ asyncio.run(main())
 
 理解这个例子时只需要记住：`AgentLoop` 是一次运行对象，`FakeAdapter` 是模型边界，
 `ToolRegistry` 是工具集合，`Session` 自动记录所有生命周期事件。
+
+### 1.2 真实模型和沙箱快速验证
+
+确认 `.env` 中已经有 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL` 和可选的
+`DEEPSEEK_MODEL` 后，可以先做不调用工具的真实请求：
+
+```bash
+python -m python_agent run "只回复：连接成功，不要调用工具" \
+  --provider deepseek \
+  --workspace "$PWD"
+```
+
+如果需要验证真实模型驱动的只读文件调用：
+
+```bash
+python -m python_agent run \
+  "只用 read_file 读取 README.md 前 5 行，然后简短概括；不要修改文件" \
+  --provider deepseek \
+  --permission-mode read-only \
+  --workspace "$PWD"
+```
+
+验证 Bash 时要同时打开 workspace-write 和审批：
+
+```bash
+python -m python_agent run \
+  "只用 bash 执行 printf sandbox-ok，不要访问网络或读写文件" \
+  --provider deepseek \
+  --permission-mode workspace-write \
+  --approve-bash \
+  --workspace "$PWD"
+```
+
+工具结果中的 `sandbox` 字段会显示 `bubblewrap-network` 或
+`bubblewrap-filesystem-restricted`。前者表示网络 namespace 探测成功；后者表示当前
+外层环境不允许网络隔离，程序会启用本地命令白名单。两种模式都会隔离 workspace 外的
+文件；`--approve-bash` 只表示审批通过，不会绕过沙箱。
 
 ---
 
@@ -125,6 +191,10 @@ flowchart TB
     Loop --> Runtime[ToolRuntime]
     Runtime --> Registry[ToolRegistry]
     Runtime --> Policies[Pre / Execute / Post]
+    Policies --> Capabilities[ToolCapabilities]
+    Policies --> Sandbox[SandboxRunner]
+    Policies --> Transaction[FileTransaction]
+    Policies --> Serialize[JSON-safe 结果]
     Runtime --> Builtins[内置工具]
     Session --> Projection[derive_messages / transcript]
     Session --> JSONL[JsonlSessionStore]
@@ -145,7 +215,8 @@ flowchart TB
 | 编排层 | `core/agent_manager.py`、`subagents/manager.py` | Handle 所有权、父子关系、释放 | 不解析 Provider JSON |
 | Agent 核心 | `core/agent.py`、`agent_loop.py`、`inbox.py` | Driver、Turn/Step、取消、排队 | 不知道 JSONL 的文件细节 |
 | 模型边界 | `llm/*` | 标准请求/响应与 Provider 转换 | 不决定何时执行工具 |
-| 工具边界 | `tools/*` | 注册、校验、策略、执行、输出规范化 | 不拥有整个 Agent 生命周期 |
+| 工具边界 | `tools/*` | 注册、能力声明、校验、策略、执行、输出规范化 | 不拥有整个 Agent 生命周期 |
+| 安全执行 | `tools/sandbox.py`、`tools/builtins/_file_transaction.py` | OS 沙箱、命令限制、文件事务和崩溃恢复 | 不决定模型是否需要调用工具 |
 | 会话层 | `session/*` | 事件追加、投影、恢复、fork、压缩 | 不调用模型、不执行工具 |
 | 扩展层 | `hooks/*`、`approval/*`、`prompt/*`、`skills/*` | 通知、审批、提示词、Skill | 不越过既有安全边界 |
 
@@ -204,6 +275,17 @@ stateDiagram-v2
 代码对外只暴露 `idle` 和 `running`。取消、释放和 Driver 收敛是内部过程；调用方通过
 `when_idle()` 等待，不需要直接管理 `asyncio.Task`。
 
+这里的 `idle` 不是任务结果：
+
+| 维度 | 可取值 | 含义 |
+|---|---|---|
+| `agent.status` | `running` / `idle` | Driver 当前是否仍在执行 |
+| `agent.task_status` | `completed` / `paused` / `cancelled` / `error` | 最近一个任务的结果状态 |
+
+例如达到 `max_steps` 后，Driver 会正常回到 `idle`，但任务状态是 `paused`，因为模型还
+没有生成最终回答。`RunResult.task_status` 提供同样的判断；不要仅凭 `status == "idle"`
+把任务当作完成。
+
 ---
 
 ## 3. Session 是核心：事件、消息和磁盘
@@ -223,7 +305,8 @@ flowchart LR
 ```
 
 带 `JsonlSessionStore` 的 Session 遵循“先落盘、后入内存”：磁盘写入失败时，
-`session.events` 不会偷偷多出一条事件。这是恢复一致性的关键。
+`session.events` 不会偷偷多出一条事件。这是恢复一致性的关键。工具结果在进入事件前
+还会经过 `to_json_safe()`，因此事件负载不会因为 `Path`、bytes 或非有限浮点数而失效。
 
 ### 3.2 当前事件词汇
 
@@ -268,10 +351,16 @@ flowchart LR
         └── events.jsonl
 ```
 
-`header.json` 保存 Session ID、cwd、父子关系、fork 来源、origin、delegation depth 和
-恢复所需的 preset 名称。`events.jsonl` 每行一个 `SessionEvent`，`seq` 从 0 连续递增。
+`header.json` 保存 Session ID、cwd、父子关系、fork 来源、origin、delegation depth、
+恢复所需的 preset 名称和 `capability_fingerprint`。指纹用于阻止恢复时悄悄替换模型、
+工具、权限、审批、排除路径或自定义策略。`events.jsonl` 每行一个 `SessionEvent`，
+`seq` 从 0 连续递增。
 
 SQLite 文件不属于事实源：它只是可以随时删除并通过 JSONL 重建的搜索索引。
+
+文件事务的临时 manifest 位于 workspace 下的 `.python-agent/transactions/`，正常提交后
+会清理；如果进程在多文件提交中退出，下一次文件工具操作会先读取 manifest 并恢复事务前
+状态。这个目录属于基础设施，不应作为模型上下文输入。
 
 ### 3.5 崩溃恢复的两层检查
 
@@ -311,9 +400,9 @@ flowchart TD
 | `session` | 9 | 事件、投影、JSONL、修复、压缩、索引 |
 | `skills` | 4 | 声明式按需 Skill |
 | `subagents` | 4 | 进程内子 Agent 生命周期 |
-| 工具及内置工具 | 15 | Schema、策略、并发、文件和 Bash |
+| 工具及内置工具 | 18 | Schema、能力、策略、并发、文件、事务和 Bash |
 | TUI / CLI | 2 | 终端展示与命令分发 |
-| **合计** | **60** | 当前 `src` 全量 |
+| **合计** | **63** | 当前 `src` 全量 |
 
 推荐阅读顺序：
 
@@ -435,9 +524,11 @@ CLI 的 `--approve-bash` 实际注入一个总返回 `True` 的 Callback；生�
 
 - `subscribe()` 按注册顺序追加，返回幂等 disposer。
 - `emit()` 依次调用精确事件和 `"*"` 通配监听器；异步 handler 会被 await，不创建
-  无主后台 Task。
+  无主后台 Task。每个 handler 的普通异常会单独记录到 `observer_errors`，不会影响 Agent。
+- 默认观察者超时为 5 秒；超时同样只记录诊断，不会阻塞 Driver 永久运行。传入
+  `observer_timeout_seconds=0` 可以为明确受信任的观察者关闭时限。
 - `emit_sync()` 给同步 `Session.append` 使用。若同步追加中碰到异步 handler，不能把
-  coroutine 偷偷丢到后台，所以会关闭 coroutine；需要异步监听时应走 `emit()`。
+  coroutine 偷偷丢到后台，所以会关闭 coroutine 并记录诊断；需要异步监听时应走 `emit()`。
 
 事件总线是实时视图，不是持久化真相源；持久化仍由 `Session.append()` 完成。
 
@@ -487,11 +578,13 @@ safety、workflow、tools、output。`assemble()` 按 `(order, id)` 排序，用
 - `ToolCall`：严格的 call ID、工具名和 dict 参数。
 - `ModelRequest`：provider、model、system、消息、工具 schema、max_tokens、temperature。
 - `AssistantResponse`：文本、完整工具调用、finish reason、usage。
-- `ModelChunk`：流式文本/工具/结束标记/usage 增量。
+- `ModelChunk`：流式文本/工具/结束标记/usage 增量；`done` 是是否收到终止分片的显式
+  信号。
 - `tool_call_data()`：把 ToolCall 转成事件日志可以直接保存的普通字典。
 
 关键点是：AgentLoop 只接受完整 `AssistantResponse` 才执行工具，不能把半截工具 JSON
-直接交给 Runtime。
+直接交给 Runtime。流式响应必须同时满足收到 `done=True` 和合法 `finish_reason`；缺少终止
+分片、`finish_reason=length` 或 `error` 时，工具调用会被丢弃或请求会失败。
 
 ### 7.3 `src/python_agent/llm/adapter.py`
 
@@ -535,11 +628,12 @@ Provider 专属逻辑全部收口在这里：
    抛 `ModelError`，Key 只保存在内存。
 3. `complete()` 用标准库 `urllib` 放进 `asyncio.to_thread()`，避免阻塞事件循环。
 4. `stream()` 用 `httpx.AsyncClient` 读取 SSE，跳过非 `data:` 行，严格要求 `[DONE]`
-   和 finish reason；文本立即 yield。
+   和 finish reason；文本立即 yield。上层 AgentLoop 还会再次检查通用 `done` 完成性。
 5. 工具调用按 `index` 累积 id、函数名和原始 arguments；只有流结束后才 `_finish_stream_call()`
    做 JSON 解析。
 6. `finish_reason="length"` 时丢弃所有累积工具调用，避免把不完整参数送入工具。
-7. HTTP、传输、JSON、缺失 DONE、Provider error 都转成带稳定标记的 `ModelError`，供
+7. HTTP、传输、JSON、缺失 DONE、未知 finish reason、Provider error 都转成带稳定标记的
+   `ModelError`，供
    默认重试策略判断。
 
 `_parse_response()` 对 choices/message/tool_calls/function/usage 逐层做结构检查，不用
@@ -559,7 +653,7 @@ Provider 专属逻辑全部收口在这里：
 - `SESSION_HEADER_VERSION` 和 `SESSION_EVENT_VERSION` 分开维护，允许未来单独演进。
 - `utc_now()` 总是返回带 UTC 时区的 datetime。
 - `SessionHeader` 保存 Session 身份、创建来源、cwd、父级、fork lineage、origin、
-  delegation depth 和 agent preset。
+  delegation depth、agent preset 和 `capability_fingerprint`。
 - `SessionEvent` 保存 version、连续 seq、时间、类型、JSON data、来源事件序号和
   `ignorable` 标记。
 - `data` 的 field validator 用 `json.dumps(..., allow_nan=False)` 拒绝 Path、对象实例、
@@ -625,8 +719,9 @@ Provider 专属逻辑全部收口在这里：
 - `load()` 先做物理检查，再读 Header/Event、跑一次消息投影、分析语义尾部，最后绑定
   writer；`repair=True` 才允许补偿。
 - `_append_event_sync()` 每次写一整行并 fsync，检查前一行确实以 newline 结束。
-- `fork()` 精确复制事件快照，生成新 Header 的 `forked_from_session_id`；它不是
-  `parent_session_id`，不会被当作子 Agent。
+- `fork()` 精确复制事件快照，生成新 Header 的 `forked_from_session_id`；它会把
+  `parent_session_id` 清空、`origin` 设为 `user`、`delegation_depth` 重置为 0，因此
+  不会把 child fork 误当作子 Agent。
 - `SessionRepairReport` 同时收集物理尾部和语义修复报告。
 
 ### 8.8 `src/python_agent/session/compaction.py`
@@ -661,8 +756,8 @@ Provider 专属逻辑全部收口在这里：
 
 ### 9.1 `src/python_agent/tools/__init__.py`
 
-导出 `FunctionTool`、`ToolDefinition`、`ToolRegistry`、`ToolRuntime`、`ToolContext`、
-`ToolResult`。具体策略和内置工具不在这里自动注册。
+导出 `FunctionTool`、`ToolCapabilities`、`ToolDefinition`、`ToolRegistry`、`ToolRuntime`、
+`ToolContext`、`ToolResult`。具体策略和内置工具不在这里自动注册。
 
 ### 9.2 `src/python_agent/tools/types.py`
 
@@ -674,15 +769,16 @@ Provider 专属逻辑全部收口在这里：
 
 ### 9.3 `src/python_agent/tools/definition.py`
 
-`ToolDefinition` Protocol 只关心稳定元数据、`is_concurrency_safe()` 和 async `execute()`。
-`FunctionTool` 将同步或异步普通函数包装成工具，并提供 OpenAI function schema：
+`ToolDefinition` Protocol 还要求显式声明 `ToolCapabilities`；缺少能力声明的扩展按潜在
+危险工具处理。`FunctionTool` 将同步或异步普通函数包装成工具，并提供 OpenAI function
+schema。
 
 ```python
-from python_agent.tools.definition import FunctionTool
+from python_agent.tools.definition import FunctionTool, ToolCapabilities
 
 upper = FunctionTool(
     name="upper",
-    description="Upper-case text",
+    description="将文本转换为大写",
     parameters={
         "type": "object",
         "properties": {"text": {"type": "string", "minLength": 1}},
@@ -691,6 +787,13 @@ upper = FunctionTool(
     },
     body=lambda arguments, context: arguments["text"].upper(),
     concurrency_safe=True,
+    capabilities=ToolCapabilities(
+        read_only=True,
+        destructive=False,
+        open_world=False,
+        concurrency_safe=True,
+        requires_approval=False,
+    ),
 )
 ```
 
@@ -730,16 +833,18 @@ ArgumentValidationPolicy
 - `ArgumentValidationPolicy` 失败就短路。
 - `WorkspacePathPolicy` 检查文件工具的 `path`、Bash 的 `cwd` 和 patch 内所有目标
   路径；`safe_path()` 解析符号链接后再检查边界。
-- `PermissionPolicy` 在 `read-only` 模式拒绝 `write_file`、`apply_patch`、`bash`。
-- `ApprovalPolicy` 对 `approval_required` 中的工具要求显式批准；缺少 service、回调
-  异常或返回 False 都拒绝。
+- `PermissionPolicy` 不再按工具名称判断，而是读取 `ToolCapabilities`。read-only 工具应
+  声明 `read_only=True`；未声明能力的自定义工具按危险操作拒绝。
+- `ApprovalPolicy` 同时考虑配置中的 `approval_required` 和工具自身的
+  `requires_approval`；缺少 service、回调异常或返回 False 都拒绝。
 
 #### Execute / Post 策略
 
 - `TimeoutPolicy` 对有 `timeout_seconds` 的工具使用 `asyncio.wait_for()`；Bash 有自己
   的进程组终止逻辑，所以通过 `handles_own_timeout=True` 跳过外层同超时取消。
-- `OutputPolicy` 把结果序列化成文本。超过上限时返回 preview、总字符数和 spill 路径；
-  优先写 workspace 的 `.python-agent/tool-output/`，没有 workspace 才写系统临时目录。
+- `OutputPolicy` 先调用 `to_json_safe()` 归一化 `Path`、bytes、日期、集合和标量，避免
+  不可序列化结果破坏 Session；然后把结果转换成文本。超过上限时返回 preview、总字符数
+  和 spill 路径；优先写 workspace 的 `.python-agent/tool-output/`。
 
 ### 9.6 `src/python_agent/tools/runtime.py`
 
@@ -765,10 +870,24 @@ flowchart LR
 ### 9.7 `src/python_agent/tools/builtins/__init__.py`
 
 只导出七个内置工具类：`ReadFileTool`、`ListFilesTool`、`SearchTextTool`、`EchoTool`、
-`WriteFileTool`、`ApplyPatchTool`、`BashTool`。是否注册和是否允许执行由 CLI/Runtime
-决定，导入一个类不会自动给模型授权。
+`WriteFileTool`、`ApplyPatchTool`、`BashTool`。此外，`_file_transaction.py`、`sandbox.py`
+和 `serialization.py` 是内部安全基础设施，不作为内置模型工具直接暴露。工具是否注册和
+是否允许执行由 CLI/Runtime 决定，导入一个类不会自动给模型授权。
 
-### 9.8 `src/python_agent/tools/builtins/_paths.py`
+### 9.8 内部安全基础设施：事务、沙箱和序列化
+
+这三个模块不直接作为模型工具暴露，但它们是 P0 安全边界的基础：
+
+- `tools/builtins/_file_transaction.py`：为多文件 patch 捕获 hash/mtime 快照，在私有
+  暂存目录中准备内容，写入持久化 manifest；提交失败逆序回滚，进程在提交中退出
+  时，下一次文件工具操作会恢复未完成事务。
+- `tools/sandbox.py`：用 bubblewrap 构造只挂载 `/workspace` 的进程命名空间，系统目录只读、
+  `/tmp` 独立；网络 namespace 可用时隔离外网，不可用时启用本地命令白名单，并且找不到
+  bubblewrap 时 fail closed。
+- `tools/serialization.py`：把 Path、bytes、日期、集合和有限标量转换为严格 JSON-safe
+  值，限制递归深度和节点数，避免任意工具结果破坏 Session 事件。
+
+### 9.9 `src/python_agent/tools/builtins/_paths.py`
 
 所有文件工具共享这里的边界函数：
 
@@ -779,23 +898,23 @@ flowchart LR
 - `is_sensitive_path()`：拒绝 `.env`、`.env.*`（安全示例除外）、`.ssh/.aws/.gnupg/`
   等目录，以及 `.pem/.key/.p12/.pfx`；`should_hide_path()` 给 list/search 复用。
 
-### 9.9 `src/python_agent/tools/builtins/echo.py`
+### 9.10 `src/python_agent/tools/builtins/echo.py`
 
 最小只读工具。要求 `value`，原样返回；`is_concurrency_safe()` 为 True。它是检查
 Registry、Runtime 和离线模型闭环最方便的 smoke tool。
 
-### 9.10 `src/python_agent/tools/builtins/read_file.py`
+### 9.11 `src/python_agent/tools/builtins/read_file.py`
 
 只读 UTF-8 文本读取：`safe_path()` 限制 workspace，文件不存在或编码/IO 错误变成
 `ToolError`；支持零基 `offset` 和 `limit` 行窗口，避免把大文件一次送入模型。
 
-### 9.11 `src/python_agent/tools/builtins/list_files.py`
+### 9.12 `src/python_agent/tools/builtins/list_files.py`
 
 递归列文件，默认最多 100、绝对上限 500；跳过 `.git`、`.venv`、`__pycache__`、
 `node_modules`、测试/构建缓存和 `.python-agent`，同时使用 `should_hide_path()`。结果
 是相对于传入根目录的 POSIX 路径，工具被标记为并发安全。
 
-### 9.12 `src/python_agent/tools/builtins/search_text.py`
+### 9.13 `src/python_agent/tools/builtins/search_text.py`
 
 优先使用 argv 形式的 `rg`，没有 `rg` 才用 Python 逐文件逐行回退：
 
@@ -804,31 +923,37 @@ Registry、Runtime 和离线模型闭环最方便的 smoke tool。
 - 用 `Popen(start_new_session=True)` + `poll()` 异步等待，取消时终止整个进程组。
 - `--max-count` 配合最终切片实施全局最大结果数。
 
-### 9.13 `src/python_agent/tools/builtins/write_file.py`
+### 9.14 `src/python_agent/tools/builtins/write_file.py`
 
-写工具要求 `workspace-write`，即使绕过 Runtime 直接调用也会再次检查。它先在目标
-目录创建临时文件、写入、flush、fsync，再用 `os.replace()` 替换目标，尽量避免中断时
-留下半文件；返回相对路径和 UTF-8 字节数。它是 exclusive 工具。
+写工具要求 `workspace-write`，即使绕过 Runtime 直接调用也会再次检查。执行前会先恢复
+workspace 中遗留的未完成文件事务；然后在目标目录创建临时文件、写入、flush、fsync，
+再用 `os.replace()` 替换目标，尽量避免中断时留下半文件；返回相对路径和 UTF-8 字节数。
+它是 exclusive 工具。
 
-### 9.14 `src/python_agent/tools/builtins/apply_patch.py`
+### 9.15 `src/python_agent/tools/builtins/apply_patch.py`
 
 支持 Codex 风格的 `*** Begin Patch` / `*** End Patch`，以及 Add/Update/Delete：
 
 1. `_parse()` 先拆出每个文件操作。
 2. 对所有目标路径和文件存在性做预校验。
 3. Update 用 `@@` hunk 和上下文序列定位，按 hunk 顺序向后搜索，避免重复上下文错配。
-4. 全部内容算好后才进入写入循环。
+4. 全部内容先交给 `FileTransaction`：暂存、hash/mtime 前置条件、持久化 manifest，
+   然后再提交；提交失败会逆序回滚，进程崩溃后下一次文件工具操作会恢复未完成事务。
 
-它能避免“格式错误导致第一文件已改、第二文件才失败”的常见问题，但多文件写入阶段
-仍是逐个写入，并不是跨文件事务。它是 exclusive 工具。
+它是 exclusive 工具，避免“格式错误或第二个文件失败导致半个 patch”成为模型可见事实。
 
-### 9.15 `src/python_agent/tools/builtins/bash.py`
+### 9.16 `src/python_agent/tools/builtins/bash.py`
 
-Bash 同时受 workspace-write 和 ApprovalPolicy 约束。执行细节：
+Bash 同时受 workspace-write、ApprovalPolicy 和 `SandboxRunner` 约束。执行细节：
 
-- 命令传给新的 `bash -lc`，每次调用不继承上次 cwd/函数。
+- 命令传给新的 `bash -lc`，每次调用不继承上次 cwd/函数，并在 bubblewrap namespace 中运行。
+- workspace 只挂载到隔离的 `/workspace`；系统目录只读，`/tmp` 是独立 tmpfs。
+- 先用 `bwrap --ro-bind / / --unshare-net -- /bin/true` 探测网络 namespace。可用时使用
+  `bubblewrap-network` 模式并隔离外网；不可用时使用 `bubblewrap-filesystem-restricted`
+  模式和本地命令白名单。
+- 找不到 bubblewrap 时 fail closed，不会回退到宿主机 Shell。
 - 创建独立进程组，stdout/stderr 写临时文件，异步 `poll()` 等待。
-- 启动子进程前移除 `DEEPSEEK_API_KEY`、`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`。
+- 子进程只保留最小非敏感环境变量，不继承 API Key 或其他宿主环境秘密。
 - 超时或取消时先 SIGTERM 整个进程组，宽限后升级 SIGKILL。
 - `handles_own_timeout=True`，超时结果包含实际秒数，便于模型修正。
 
@@ -893,6 +1018,10 @@ user/message 的消息才放回队首。这解决“出队后、写入模型历�
 
 - `_complete_response()` 检测 adapter 是否有 callable `stream`。有则实时发出
   `assistant/delta`，但只在结束后生成一个完整 `assistant/message`。
+- 流式响应必须收到 `done=True` 和合法 `finish_reason`；自然关闭但没有终止分片会生成
+  `LLM_STREAM_CLOSED`。`length` 会清空工具调用，`error` 会变成模型边界错误。
+- `_safe_response()` 对 complete-only Adapter 再做一次相同防御，避免不合规 Adapter 返回
+  “工具调用 + length”时进入 Runtime。
 - `_request_with_status()` 维护 `active_request`，发送 request_start/request_end，
   `finally` 一定清理状态。
 - `_request_with_retries()` 每次失败追加 `request/error`，策略允许时追加
@@ -937,13 +1066,18 @@ for step in range(max_steps):
 - `followup()` 入 `next_turn` 并确保 Driver。
 - `steer()` 入 `next_step` 并确保 Driver。
 - `inject()` 只入队，不唤醒 idle Agent。
+- `task_status` 独立记录最近任务是 `completed`、`paused`、`cancelled` 还是 `error`；
+  Driver 回到 `idle` 不会覆盖这个结果状态。
+- `continue_task()` 只允许继续 `paused` 任务，把继续指令作为可审计的 followup 放进
+  Inbox；它会沿用已有 Session 上下文开启新的 Turn。
 - `run()` 是兼容 API：followup 后等待 idle。
 - `cancel()` 可清空 Inbox 或 `keep_inbox=True` 保留待处理消息；先设置 Loop 的取消
   事件，再取消并 shield Driver，最后发状态事件。
 - `when_idle()` 等待 idle event 和 Driver 真正 done，并把 Driver 错误重新抛给调用方。
 - `_ensure_driver()` 在 lock 下保证最多一个 Driver。
 - `_drive()` 连续领取 wakeup 消息并逐个调用 `loop.run_turn()`；Driver 结束后才设置
-  idle event。
+  idle event。正常 Turn 结果会更新 `task_status`；`max_steps`、`length` 或预算耗尽
+  会变成 `paused`，异常和取消分别变成 `error` / `cancelled`。
 
 Session 事件经 `_on_session_event()` 同步转发为 `session/event`；Loop 事件经
 `_on_loop_event()` 转发，`tool/result` 还会别名广播为 `tools/result`。
@@ -958,7 +1092,9 @@ Session 事件经 `_on_session_event()` 同步转发为 `session/event`；Loop �
   Agent 读取自己的事件日志/索引。
 - `register_preset()` 禁止重复 ID。
 - `resume()` 只能使用 Header 记录的 preset；显式 config 的 ID 不匹配或没有注册都拒绝，
-  防止重启后悄悄换模型、工具或权限。恢复时开启孤立 claim 找回。
+  防止重启后悄悄换模型、工具或权限。若 Header 有 `capability_fingerprint`，还会校验
+  工具 schema、能力、system prompt、审批、排除路径、spill 和自定义策略；恢复时开启
+  孤立 claim 找回。
 - `fork_session()` 只创建 Session 分支，不自动创建 Agent。
 - `dispose()` 先由 SubagentManager child-first 释放后代，再释放目标 Handle。
 - `shutdown()` 先处理根 Agent，再收敛遗留孤儿。
@@ -1017,12 +1153,12 @@ Skill，并用当前 `ToolRegistry.names()` 检查声明工具。完整 Skill �
 1. `enable_for(agent)` 按配置注册**绑定具体父 Agent** 的管理工具；达到最大深度时不
    注册 `spawn_agent`。
 2. `start()` 检查 prompt、启用状态、深度、直接 child 数量和工具子集；生成稳定 child
-   preset ID；继承父 workspace/权限、`approval_required` 配置和预算等配置，只允许收窄
-   max_steps、tools。审批 service 实例不是 `AgentPreset` 字段，当前 `start()` 不会自动
-   透传父级回调；child 使用需要审批的工具时若没有应用层另行注入 service，会安全拒绝。
+   preset ID；继承父 workspace/权限、`approval_required`、排除路径、审批 service、spill
+   目录、自定义策略和 retry policy，只允许收窄 max_steps、tools。
 3. child 通过 `AgentManager.create()` 获得独立 Session、Inbox、Loop 和 Driver。
-4. 每个 child 有一个长期 watcher，等待 child idle 后发布 `subagent/settled`，并把
-   `[subagent/result child_id=...]` 作为 inject 写入父级 Inbox。
+4. 每个 child 有一个长期 watcher，等待 child idle 后发布 `subagent/settled`。异步提交会把
+   `[subagent/result child_id=...]` 作为 inject 写入父级 Inbox；同步 `wait=True` 提交只
+   返回 tool result，避免同一答案重复进入上下文。
 5. generation + Condition 避免 `wait()` 在通知竞态中提前返回；followup 期间如果
    generation 变化，watcher 会重新观察。
 6. `dispose_descendants()` 递归 grandchild → child；`_dispose_record()` 取消 watcher、
@@ -1034,8 +1170,9 @@ Skill，并用当前 `ToolRegistry.names()` 检查声明工具。完整 Skill �
 
 四个模型可调用工具都是 exclusive，原因是它们改变 Manager 所有权图或 child Inbox：
 
-- `SpawnAgentTool`：校验 `SubagentSpec`，返回 child ID；`wait=True` 时返回 answer。
-- `SubagentFollowupTool`：只允许直接父级向 child 提交新 Turn。
+- `SpawnAgentTool`：校验 `SubagentSpec`，返回 child ID；`wait=True` 时同步返回 answer，
+  并抑制 watcher 的重复 inject。
+- `SubagentFollowupTool`：只允许直接父级向 child 提交新 Turn，也支持同步或异步结果投递。
 - `SubagentInterruptTool`：只允许直接父级取消 child 并清空待处理 Inbox。
 - `ListSubagentsTool`：只列当前父级的直接孩子，不泄露兄弟/后代。
 
@@ -1060,8 +1197,8 @@ CLI 是接入层，不复制 Agent 逻辑。
 
 `_create_agent()` 统一注册七个内置工具；`--skills-root` 才额外注册 Skill 工具。
 Provider 为 fake 时用 `FakeAdapter`，DeepSeek 时构造 `DeepSeekAdapter`。CLI 把关键能力
-拼进 `preset_id`：provider、model、权限、步数、阶段五限制、子 Agent 限制和 skills root。
-这使 `--resume` 时不匹配配置会明确失败。
+拼进 `preset_id`，并由 `AgentManager` 将完整工具 schema、ToolCapabilities、system prompt、
+权限和策略写入 `capability_fingerprint`。这使 `--resume` 时不匹配配置会明确失败。
 
 Store 默认是 workspace 下的 `.python-agent`；`AgentManager` 额外排除整个 Store 根目录。
 
@@ -1083,9 +1220,13 @@ search-sessions 查询索引
 
 #### chat 分发
 
-`_dispatch_chat_line()` 处理 `/help`、`/steer`、`/inject`、`/cancel [keep]`、`/status`、
-`/transcript`、`/tools`、`/wait`、`/exit`；其他文本一律是 followup。它会清理误复制的
-`你>` 前缀，并在 Agent 已运行时明确显示“已排队”。
+`_dispatch_chat_line()` 处理 `/help`、`/steer`、`/inject`、`/cancel [keep]`、`/continue`、
+`/status`、`/transcript`、`/tools`、`/wait`、`/exit`；其他文本一律是 followup。它会清理
+误复制的 `你>` 前缀，并在 Agent 已运行时明确显示“已排队”。
+
+`/continue` 只用于继续最近一个 `paused` 任务；如果 Agent 已经 idle 但任务状态是
+`paused`，普通文本会开启一个新的 Turn，并提示“上一个任务尚未生成最终回答”。这让
+用户可以明确选择继续旧任务，或开始新的任务，而不会把两者都显示成“已完成”。
 
 `_chat()` 在 stdin/stdout 都是 TTY 且没有 `--plain` 时使用 `FullScreenTerminalUI`；
 否则使用 `PromptSession` 纯文本 REPL。`main()` 还把无子命令参数改写成 `chat`，并把
@@ -1154,18 +1295,22 @@ from python_agent.tools.registry import ToolRegistry
 
 
 async def main() -> None:
-    adapter = FakeAdapter([
-        {
-            "content": None,
-            "tool_calls": [{
-                "id": "echo-1",
-                "name": "echo",
-                "arguments": {"value": "from tool"},
-            }],
-            "finish_reason": "tool_calls",
-        },
-        {"content": "工具已经返回 from tool", "finish_reason": "stop"},
-    ])
+    adapter = FakeAdapter(
+        [
+            {
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "echo-1",
+                        "name": "echo",
+                        "arguments": {"value": "from tool"},
+                    }
+                ],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "工具已经返回 from tool", "finish_reason": "stop"},
+        ]
+    )
     result = await AgentLoop(adapter, ToolRegistry([EchoTool()])).run("调用 echo")
     print(result.answer)
     print([event.type for event in result.session.events])
@@ -1186,7 +1331,7 @@ from pathlib import Path
 
 from python_agent.ids import SessionId
 from python_agent.llm.types import ToolCall
-from python_agent.tools.definition import FunctionTool
+from python_agent.tools.definition import FunctionTool, ToolCapabilities
 from python_agent.tools.registry import ToolRegistry
 from python_agent.tools.runtime import ToolRuntime
 from python_agent.tools.types import ToolContext
@@ -1195,7 +1340,7 @@ from python_agent.tools.types import ToolContext
 async def main() -> None:
     tool = FunctionTool(
         name="upper",
-        description="Convert text to upper case",
+        description="将文本转换为大写",
         parameters={
             "type": "object",
             "properties": {"text": {"type": "string", "minLength": 1}},
@@ -1204,6 +1349,13 @@ async def main() -> None:
         },
         body=lambda arguments, context: arguments["text"].upper(),
         concurrency_safe=True,
+        capabilities=ToolCapabilities(
+            read_only=True,
+            destructive=False,
+            open_world=False,
+            concurrency_safe=True,
+            requires_approval=False,
+        ),
     )
     runtime = ToolRuntime(ToolRegistry([tool]))
     result = await runtime.execute(
@@ -1231,7 +1383,7 @@ async def main() -> None:
     agent = await manager.create(FakeAdapter())
 
     await agent.inject("这是静默背景")  # idle 时不启动模型
-    await agent.followup("真正任务")    # 唤醒，一个 Driver 处理
+    await agent.followup("真正任务")  # 唤醒，一个 Driver 处理
     await agent.when_idle()
 
     print(agent.last_result.answer)
@@ -1284,8 +1436,9 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-恢复时 `config.id` 必须与 Header 中的 `agent_preset` 一致；这不是形式要求，而是为了
-防止重启后权限、工具集或模型发生静默变化。
+恢复时 `config.id` 必须与 Header 中的 `agent_preset` 一致；如果 Header 已记录
+`capability_fingerprint`，还必须匹配工具 schema、权限、审批、排除路径、提示词和策略。
+这不是形式要求，而是为了防止重启后能力发生静默变化。
 
 ### 13.6 练习六：Skill 按需加载
 
@@ -1346,9 +1499,10 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-child 会有独立 Session ID 和 Header，且只能使用父级授权工具的子集。结果会以 inject
-写入父级 Inbox；如果父级当时正在运行，它可以在下一个 Step 消费，idle 父级不会被结果
-偷偷唤醒。
+child 会有独立 Session ID 和 Header，且只能使用父级授权工具的子集，同时继承父级的
+workspace、排除路径、审批服务和运行策略。异步结果会以 inject 写入父级 Inbox；如果父级
+当时正在运行，它可以在下一个 Step 消费，idle 父级不会被结果偷偷唤醒。同步 `wait=True`
+则只返回一份 tool result。
 
 ### 13.8 练习八：压缩和 SQLite 搜索
 
@@ -1375,14 +1529,34 @@ python -m python_agent search-sessions "工具结果" \
 
 索引没有了可以重建；`events.jsonl` 才是必须保护的事实源。
 
+### 13.9 运行 P0 回归测试
+
+修复流终止、观察者异常、Bash 沙箱、文件事务、JSON-safe 结果、能力继承和 child 结果
+投递时，使用专门的回归文件：
+
+```bash
+python -m pytest -vv tests/test_p0_regressions.py
+```
+
+关键断言包括：
+
+- 缺少 `done` 或 `finish_reason=length` 时，工具主体执行次数为 0。
+- 观察者抛错或超时后，Agent 仍回到 `idle`。
+- 即使审批通过，Bash 也不能读取 workspace 外文件。
+- 多文件事务失败后，第一个文件也会回滚。
+- `Path` 等工具结果会在 Session append 前转换为 JSON-safe 值。
+- 未声明能力的自定义工具在 read-only 模式下被拒绝。
+- child fork 会重置 lineage；同步 child 结果只进入父上下文一次。
+
 ---
 
 ## 14. 安全、并发和恢复时最容易误解的点
 
 ### 14.1 `read-only` 不是“工具不存在”
 
-CLI 会把读写工具都注册给模型，但 `PermissionPolicy` 在执行前拒绝写工具。这样模型
-可以知道存在 `write_file`，也能看到明确错误并自我修正；实际副作用不会发生。
+CLI 会把读写工具都注册给模型，但 `PermissionPolicy` 会根据每个工具的
+`ToolCapabilities` 在执行前判断。这样模型可以知道存在 `write_file`，也能看到明确错误
+并自我修正；实际副作用不会发生。未声明能力的自定义工具默认按危险操作处理。
 
 要写文件必须同时满足：
 
@@ -1393,14 +1567,15 @@ permission_mode == workspace-write
 
 ### 14.2 `--approve-bash` 只解决审批
 
-它不修复模型输出截断，不扩大 workspace，也不替代参数校验。当前 `BashTool` 仍移除
-常见 API Key 环境变量并限制 cwd。
+它不修复模型输出截断，不扩大 workspace，也不替代参数校验。Bash 的实际访问范围仍
+由 OS 沙箱和受限命令策略决定；审批不会绕过沙箱。
 
-### 14.3 并发安全必须由工具声明
+### 14.3 能力和并发安全必须由工具声明
 
-Echo、read/list/search/Skill list/load 声明安全；写文件、patch、Bash 和子 Agent 管理
-工具是 exclusive。工具实际完成顺序可能乱，但 Session 的 `tool/result` 事件按模型给出
-的 call 顺序提交，保证下一次请求稳定。
+Echo、read/list/search/Skill list/load 声明只读和并发安全；写文件、patch、Bash 和子 Agent
+管理工具声明为 exclusive。自定义 `FunctionTool` 如果没有显式传入
+`ToolCapabilities(read_only=True, ...)`，在 read-only 模式下会被拒绝。工具实际完成顺序
+可能乱，但 Session 的 `tool/result` 事件按模型给出的 call 顺序提交，保证下一次请求稳定。
 
 ### 14.4 事件日志不要手工删除行
 
@@ -1428,6 +1603,21 @@ DeepSeek stream 会把工具 id、名称、参数拆成多个 SSE delta；适配
 
 取消先设置共享 `cancel_event`，再让 Driver/模型/工具协作退出；Bash 额外终止进程组，
 并发 Runtime 显式收敛已创建 Task。这样 `when_idle()` 返回时，资源确实已经归属结束。
+
+### 14.8 Bash 沙箱探测和 WSL
+
+正确的 bubblewrap 探测必须把测试程序一起挂载：
+
+```bash
+bwrap --ro-bind / / --unshare-net -- /bin/true
+echo $?
+```
+
+只运行 `bwrap --unshare-net -- /bin/true` 可能因为命名空间中没有 `/bin/true` 而失败，
+不能据此判断网络 namespace 不可用。探测成功时工具结果中的 `sandbox` 为
+`bubblewrap-network`；探测失败时为 `bubblewrap-filesystem-restricted`，并启用本地命令
+白名单。后者不允许 `git`、`python`、`curl` 等开放能力命令，避免在网络未隔离时静默
+放行宿主机操作。
 
 ---
 
@@ -1479,6 +1669,7 @@ python-agent search-sessions "关键词" --limit 20
 /inject 内容      写入上下文但不唤醒 idle Agent
 /cancel           取消并清空 Inbox
 /cancel keep      取消但保留 Inbox
+/continue         继续上一个因执行限制暂停的任务
 /status           状态、队列和当前模型请求
 /transcript       当前 transcript
 /tools            展开/折叠工具详情（全屏 UI）
@@ -1502,17 +1693,18 @@ python-agent search-sessions "关键词" --limit 20
 | `test_stage5.py` | 并发 batch、屏障、取消、预算、重试 |
 | `test_stage6.py` | child 工具子集、直接父级鉴权、深度/数量、释放和 wait |
 | `test_stage7.py` | summary、fork lineage、Skill、SQLite |
+| `test_p0_regressions.py` | 流终止、观察者隔离、Bash 沙箱、文件事务、JSON-safe、能力继承和结果去重 |
 | `test_deepseek_adapter.py` | env、SSE DONE、length、HTTP 错误和工具片段 |
-| `test_cli_chat.py`、`test_terminal_ui.py` | 命令分发、队列提示、TUI 回放和滚动 |
+| `test_cli_chat.py`、`test_terminal_ui.py` | 命令分发、队列提示、任务暂停/继续、TUI 回放和滚动 |
 | `test_security_regressions.py` | 敏感凭据、动态 Store 排除、Schema 范围、权限 |
 
-在本次源码阅读中使用 `agent` 环境实测：
+在当前工作树中使用 `agent` 环境实测：
 
 ```text
-pytest -q                 → 92 passed
-ruff format --check .     → 78 files already formatted
+pytest -q                 → 109 passed
+ruff format --check src tests → 79 files already formatted
 ruff check .              → All checks passed
-mypy                      → Success: no issues found in 60 source files
+mypy                      → Success: no issues found in 63 source files
 ```
 
 这四项是最值得在修改后重复的回归入口。若只改 Session 或工具策略，至少运行对应的
@@ -1528,11 +1720,15 @@ mypy                      → Success: no issues found in 60 source files
 - ModelRouter 在 `llm/adapter.py`，没有独立 `llm/router.py`。
 - 当前没有 `todo_write`、`observability/`、`prompt/context.py`、`approval/policy.py`。
 - 阶段 7 选的是 summary surface replacement、fork、声明式 Skills、SQLite 搜索；远程
-  Subagent Provider、Code Mode、LSP、PTY、OS 沙箱和 Web/RPC UI 没有实现。
+  Subagent Provider、Code Mode、LSP、PTY 和 Web/RPC UI 仍没有实现。OS 沙箱已经由
+  `tools/sandbox.py` 提供 Linux/WSL bubblewrap 实现；macOS Seatbelt、Windows 受限进程等
+  平台实现仍是后续工作。
 - 子 Agent 是进程内生命周期；Session 会落盘，但进程重启不会自动恢复活跃父子管理图。
 - `ContextCompactor` 接受外部摘要；当前 CLI 走人工 `--summary` / `--summary-file`，
   没有自动摘要 Provider。
 - `write_file` 把完整内容放进 JSON 参数；大文件分块/freeform patch 仍是改进方向。
+- `apply_patch` 已有 `FileTransaction` 的 staging、hash/mtime、回滚和崩溃恢复，但跨文件
+  提交仍依赖下一次文件操作触发未完成事务恢复；没有操作系统级多文件原子 rename。
 - `OutputPolicy` 当前主要按字符数限制，不是完整的原始 stdout/stderr 字节 retention。
 
 这些不是教程推测，而是按当前 `src` 和 `IMPROVEMENTS.md` 对照后的边界。扩展项目时，

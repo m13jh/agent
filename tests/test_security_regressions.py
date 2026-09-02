@@ -14,7 +14,7 @@ from python_agent.session.events import SessionHeader
 from python_agent.session.jsonl_store import JsonlSessionStore
 from python_agent.session.sqlite_index import SqliteSessionIndex
 from python_agent.tools.builtins import ListFilesTool, ReadFileTool, SearchTextTool
-from python_agent.tools.definition import FunctionTool
+from python_agent.tools.definition import FunctionTool, ToolCapabilities
 from python_agent.tools.registry import ToolRegistry
 from python_agent.tools.runtime import ToolRuntime
 from python_agent.tools.types import ToolContext
@@ -107,6 +107,13 @@ async def test_json_schema_ranges_and_nested_array_items_are_enforced(tmp_path: 
             "additionalProperties": False,
         },
         body=body,
+        capabilities=ToolCapabilities(
+            read_only=True,
+            destructive=False,
+            open_world=False,
+            concurrency_safe=False,
+            requires_approval=False,
+        ),
     )
     runtime = ToolRuntime(ToolRegistry([tool]))
     context = ToolContext(session_id=SessionId("schema"), workspace=tmp_path)

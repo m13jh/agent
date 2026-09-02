@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, cast
 
 from python_agent.errors import ToolError
+from python_agent.tools.builtins._file_transaction import FileTransaction
 from python_agent.tools.builtins._paths import safe_path, workspace_root
+from python_agent.tools.definition import ToolCapabilities
 from python_agent.tools.types import ToolContext
 
 PatchAction = Literal["add", "update", "delete"]
@@ -42,6 +45,13 @@ class ApplyPatchTool:
         "additionalProperties": False,
     }
     timeout_seconds: float | None = 20.0
+    capabilities = ToolCapabilities(
+        read_only=False,
+        destructive=True,
+        open_world=False,
+        concurrency_safe=False,
+        requires_approval=False,
+    )
 
     def is_concurrency_safe(self, arguments: dict[str, Any]) -> bool:
         """补丁可能同时修改多个文件，必须在工具调度中形成独占屏障。"""
@@ -53,8 +63,9 @@ class ApplyPatchTool:
 
         if context.permission_mode != "workspace-write":
             raise ToolError("apply_patch requires workspace-write mode")
+        FileTransaction.recover_pending(workspace_root(context))
         operations = self._parse(arguments["patch"])
-        changes: list[tuple[str, str | None]] = []
+        changes: list[tuple[Path, bytes | None]] = []
         for operation in operations:
             path = safe_path(operation.path, context)
             if operation.action == "add":
@@ -73,17 +84,11 @@ class ApplyPatchTool:
                 except (OSError, UnicodeError) as exc:
                     raise ToolError(f"cannot read {operation.path}: {exc}") from exc
                 content = self._apply_update(original, operation.lines, operation.path)
-            changes.append((operation.path, content))
+            changes.append((path, None if content is None else content.encode("utf-8")))
 
-        for relative_path, content in changes:
-            path = safe_path(relative_path, context)
-            if content is None:
-                path.unlink()
-            else:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content, encoding="utf-8")
+        FileTransaction(workspace_root(context), changes).commit()
         return {
-            "files": [relative_path for relative_path, _ in changes],
+            "files": [operation.path for operation in operations],
             "changed_files": len(changes),
             "workspace": str(workspace_root(context)),
         }

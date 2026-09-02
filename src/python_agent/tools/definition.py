@@ -5,11 +5,27 @@ from __future__ import annotations
 import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from python_agent.tools.types import ToolContext
 
 ToolBody = Callable[[dict[str, Any], ToolContext], Any | Awaitable[Any]]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCapabilities:
+    """工具明确声明的安全属性和调度属性。
+
+    默认值有意采用 fail-closed：没有声明能力的扩展会被视为可能破坏数据、可访问外部世界
+    且需要审批的操作。内置工具和明确的只读应用工具必须主动选择更安全的值。
+    """
+
+    read_only: bool = False
+    destructive: bool = True
+    open_world: bool = True
+    concurrency_safe: bool = False
+    requires_approval: bool = True
+    interrupt_behavior: Literal["cancel", "block"] = "cancel"
 
 
 @runtime_checkable
@@ -24,6 +40,7 @@ class ToolDefinition(Protocol):
     description: str
     parameters: dict[str, Any]
     timeout_seconds: float | None
+    capabilities: ToolCapabilities
 
     def is_concurrency_safe(self, arguments: dict[str, Any]) -> bool:
         """声明给定参数是否允许未来的并发调度器重叠执行。"""
@@ -38,7 +55,11 @@ class ToolDefinition(Protocol):
 
 @dataclass(slots=True)
 class FunctionTool:
-    """把一个同步或异步 Python 函数包装成符合 ToolDefinition 的工具。"""
+    """把一个同步或异步 Python 函数包装成符合 ToolDefinition 的工具。
+
+    只读扩展应显式提供 ``capabilities``。默认能力有意保持危险，未分类函数不能通过只读
+    Agent 执行。
+    """
 
     name: str
     description: str
@@ -46,11 +67,13 @@ class FunctionTool:
     body: ToolBody
     timeout_seconds: float | None = None
     concurrency_safe: bool = False
+    capabilities: ToolCapabilities = ToolCapabilities()
 
     def is_concurrency_safe(self, arguments: dict[str, Any]) -> bool:
         """返回注册时声明的并发能力；阶段 1—3默认由 Runtime 串行调度。"""
 
-        return self.concurrency_safe
+        del arguments
+        return self.concurrency_safe and self.capabilities.concurrency_safe
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> Any:
         """执行 body，并兼容 body 返回普通值或 Awaitable 的两种写法。"""

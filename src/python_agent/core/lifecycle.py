@@ -19,3 +19,31 @@ class CancelCause(BaseModel):
 
 
 AgentStatus = Literal["idle", "running"]
+
+# Driver 是否存活和最近一个任务是否完成是两个独立维度。AgentStatus 只描述前者；
+# TaskStatus 用于让调用方区分“Driver 已回到 idle”与“任务确实生成了最终答案”。
+TaskStatus = Literal["completed", "paused", "cancelled", "error"]
+
+_PAUSED_FINISH_REASONS = frozenset(
+    {
+        "max_steps",
+        "max_tokens",
+        "length",
+        "token_budget",
+        "cost_budget",
+        "wall_time",
+        "crash_recovered",
+    }
+)
+
+
+def task_status_for_finish_reason(reason: str) -> TaskStatus:
+    """把 Turn 终止原因映射成调用方可见的最近任务状态。"""
+
+    if reason in _PAUSED_FINISH_REASONS:
+        return "paused"
+    if reason == "aborted":
+        return "cancelled"
+    if reason == "error":
+        return "error"
+    return "completed"

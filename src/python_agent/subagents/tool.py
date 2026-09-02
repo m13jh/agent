@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from python_agent.core.agent import Agent
 from python_agent.ids import SessionId
 from python_agent.subagents.manager import SubagentManager
 from python_agent.subagents.types import SubagentSpec
+from python_agent.tools.definition import ToolCapabilities
 from python_agent.tools.types import ToolContext
 
 
@@ -39,6 +40,13 @@ class SpawnAgentTool:
         "additionalProperties": False,
     }
     timeout_seconds: float | None = 600.0
+    capabilities = ToolCapabilities(
+        read_only=True,
+        destructive=False,
+        open_world=False,
+        concurrency_safe=False,
+        requires_approval=False,
+    )
 
     def __init__(self, manager: SubagentManager, parent: Agent) -> None:
         self.manager = manager
@@ -61,7 +69,15 @@ class SpawnAgentTool:
             allowed_tools=arguments.get("allowed_tools"),
             max_steps=arguments.get("max_steps"),
         )
-        child_id = await self.manager.start(self.parent, arguments["prompt"], spec)
+        delivery_mode: Literal["sync", "async"] = (
+            "sync" if arguments.get("wait", False) else "async"
+        )
+        child_id = await self.manager.start(
+            self.parent,
+            arguments["prompt"],
+            spec,
+            delivery_mode=delivery_mode,
+        )
         result: dict[str, Any] = {"child_id": str(child_id), "status": "running"}
         if arguments.get("wait", False):
             settled = await self.manager.wait(self.parent, child_id)
@@ -91,6 +107,13 @@ class SubagentFollowupTool:
         "additionalProperties": False,
     }
     timeout_seconds: float | None = 600.0
+    capabilities = ToolCapabilities(
+        read_only=True,
+        destructive=False,
+        open_world=False,
+        concurrency_safe=False,
+        requires_approval=False,
+    )
 
     def __init__(self, manager: SubagentManager, parent: Agent) -> None:
         self.manager = manager
@@ -106,7 +129,15 @@ class SubagentFollowupTool:
 
         del context
         child_id = SessionId(arguments["child_id"])
-        message_id = await self.manager.followup(self.parent, child_id, arguments["prompt"])
+        delivery_mode: Literal["sync", "async"] = (
+            "sync" if arguments.get("wait", False) else "async"
+        )
+        message_id = await self.manager.followup(
+            self.parent,
+            child_id,
+            arguments["prompt"],
+            delivery_mode=delivery_mode,
+        )
         result: dict[str, Any] = {
             "child_id": str(child_id),
             "message_id": str(message_id),
@@ -136,6 +167,13 @@ class SubagentInterruptTool:
         "additionalProperties": False,
     }
     timeout_seconds: float | None = 30.0
+    capabilities = ToolCapabilities(
+        read_only=True,
+        destructive=False,
+        open_world=False,
+        concurrency_safe=False,
+        requires_approval=False,
+    )
 
     def __init__(self, manager: SubagentManager, parent: Agent) -> None:
         self.manager = manager
@@ -160,6 +198,13 @@ class ListSubagentsTool:
     description = "List direct child subagents and their latest status."
     parameters = {"type": "object", "properties": {}, "additionalProperties": False}
     timeout_seconds: float | None = 10.0
+    capabilities = ToolCapabilities(
+        read_only=True,
+        destructive=False,
+        open_world=False,
+        concurrency_safe=True,
+        requires_approval=False,
+    )
 
     def __init__(self, manager: SubagentManager, parent: Agent) -> None:
         self.manager = manager

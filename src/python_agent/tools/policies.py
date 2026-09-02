@@ -16,7 +16,8 @@ from python_agent.errors import ToolError, ToolValidationError
 from python_agent.hooks.waterfall import Waterfall
 from python_agent.llm.types import ToolCall
 from python_agent.tools.builtins._paths import safe_path, workspace_root
-from python_agent.tools.definition import ToolDefinition
+from python_agent.tools.definition import ToolCapabilities, ToolDefinition
+from python_agent.tools.serialization import JsonSerializationError, to_json_safe
 from python_agent.tools.types import ToolContext, ToolResult
 
 
@@ -225,20 +226,25 @@ class WorkspacePathPolicy:
 class PermissionPolicy:
     """Pre 策略：阻止只读 Agent 使用写入或 Shell 工具。"""
 
-    _write_tools = {"write_file", "apply_patch", "bash"}
-
     async def __call__(
         self, invocation: ToolInvocation, next_handler: Callable[..., Awaitable[Any]]
     ) -> Any:
-        """只在 workspace-write 模式下放行会改变文件或启动 Shell 的工具。"""
+        """只在 workspace-write 模式下放行明确声明会产生副作用的工具。
 
-        if (
-            invocation.tool.name in self._write_tools
-            and invocation.context.permission_mode != "workspace-write"
-        ):
+        工具名称不能作为安全边界：调用方可以注册任意工具。因此缺少或格式错误的能力声明
+        会采用 ``ToolCapabilities`` 的危险默认值，并在只读模式下被拒绝。
+        """
+
+        raw_capabilities = getattr(invocation.tool, "capabilities", None)
+        capabilities = (
+            raw_capabilities
+            if isinstance(raw_capabilities, ToolCapabilities)
+            else ToolCapabilities()
+        )
+        if invocation.context.permission_mode == "read-only" and not capabilities.read_only:
             return _error(
                 invocation,
-                f"permission denied: {invocation.tool.name} requires workspace-write mode",
+                f"permission denied: {invocation.tool.name} is not read-only",
             )
         return await next_handler(invocation)
 
@@ -261,7 +267,13 @@ class ApprovalPolicy:
     ) -> Any:
         """构造最小审批请求；审批失败或服务异常都按拒绝处理。"""
 
-        if invocation.tool.name not in self.required_tools:
+        raw_capabilities = getattr(invocation.tool, "capabilities", None)
+        capabilities = (
+            raw_capabilities
+            if isinstance(raw_capabilities, ToolCapabilities)
+            else ToolCapabilities()
+        )
+        if invocation.tool.name not in self.required_tools and not capabilities.requires_approval:
             return await next_handler(invocation)
         service = self.approval_service or invocation.context.approval_service
         if service is None:
@@ -306,10 +318,7 @@ def _serialized(value: Any) -> str:
 
     if isinstance(value, str):
         return value
-    try:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    except (TypeError, ValueError):
-        return str(value)
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
 
 
 class OutputPolicy:
@@ -327,7 +336,17 @@ class OutputPolicy:
         """执行后端结果归一化；超限时保存完整文本，只把摘要交给模型。"""
 
         result = cast(ToolResult, await next_handler(envelope))
-        text = _serialized(result.content)
+        try:
+            safe_content = to_json_safe(result.content)
+        except JsonSerializationError as exc:
+            return ToolResult(
+                call_id=envelope.invocation.call.id,
+                name=envelope.invocation.call.name,
+                content=f"JsonSerializationError: {exc}",
+                is_error=True,
+            )
+        result = result.model_copy(update={"content": safe_content})
+        text = _serialized(safe_content)
         if len(text) <= self.max_chars:
             return result
 

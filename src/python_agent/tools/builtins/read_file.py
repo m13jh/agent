@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from python_agent.errors import ToolError
+from python_agent.tools.builtins._file_transaction import FileTransaction
 from python_agent.tools.builtins._paths import safe_path
+from python_agent.tools.definition import ToolCapabilities
 from python_agent.tools.types import ToolContext
 
 
@@ -25,6 +28,13 @@ class ReadFileTool:
         "additionalProperties": False,
     }
     timeout_seconds: float | None = 10.0
+    capabilities = ToolCapabilities(
+        read_only=True,
+        destructive=False,
+        open_world=False,
+        concurrency_safe=True,
+        requires_approval=False,
+    )
 
     def is_concurrency_safe(self, arguments: dict[str, Any]) -> bool:
         """文件读取不会修改文件，因此可与其他只读调用并发。"""
@@ -34,6 +44,7 @@ class ReadFileTool:
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         """读取文件并应用 offset/limit 行窗口，避免一次把整个大文件送入模型。"""
 
+        FileTransaction.recover_pending(context.workspace or Path.cwd())
         path = safe_path(arguments["path"], context)
         if not path.is_file():
             raise ToolError(f"file does not exist: {arguments['path']}")

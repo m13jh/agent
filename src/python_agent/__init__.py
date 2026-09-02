@@ -8,7 +8,7 @@ from python_agent.config import AgentPreset
 from python_agent.core.agent import Agent
 from python_agent.core.agent_loop import AgentLoop, ModelRequestStatus, RunResult
 from python_agent.core.agent_manager import AgentManager
-from python_agent.core.lifecycle import CancelCause
+from python_agent.core.lifecycle import CancelCause, TaskStatus
 from python_agent.hooks.event_bus import LiveEventBus
 from python_agent.llm.fake_adapter import FakeAdapter
 from python_agent.llm.retry import DefaultModelRetryPolicy, ModelRetryPolicy, RetryDecision
@@ -27,6 +27,7 @@ __all__ = [
     "AgentManager",
     "AgentPreset",
     "CancelCause",
+    "TaskStatus",
     "ContextCompactor",
     "DefaultModelRetryPolicy",
     "FakeAdapter",

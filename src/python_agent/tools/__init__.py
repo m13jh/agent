@@ -4,7 +4,7 @@
 策略与内置工具仍位于各自模块，保持注册、执行和业务实现分层。
 """
 
-from python_agent.tools.definition import FunctionTool, ToolDefinition
+from python_agent.tools.definition import FunctionTool, ToolCapabilities, ToolDefinition
 from python_agent.tools.registry import ToolRegistry
 from python_agent.tools.runtime import ToolResult, ToolRuntime
 from python_agent.tools.types import ToolContext
@@ -12,6 +12,7 @@ from python_agent.tools.types import ToolContext
 __all__ = [
     "FunctionTool",
     "ToolContext",
+    "ToolCapabilities",
     "ToolDefinition",
     "ToolRegistry",
     "ToolResult",

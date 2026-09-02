@@ -19,6 +19,11 @@
 
 因此建议的目标不是复制约 51 万行的 Claude Code，而是保留 `python-agent` 的事件溯源内核，先补齐 P0 安全/正确性契约，再以小型、可替换的子系统逐步引入 Claude Code 中已经证明有价值的机制。
 
+> **实现跟进（2026-09-01）**：审计后已在源码中补入通用流终止/`length` 执行闸门、
+> EventBus 观察者隔离、bubblewrap Bash containment、文件事务与崩溃恢复、JSON-safe
+> 工具结果、ToolCapabilities fail-closed 默认、子 Agent 能力继承、fork lineage 重置和
+> 同步 child 结果去重。原下文的复现记录保留为修复前证据；当前回归测试为 106 passed。
+
 ## 1. 阅读范围、证据和可比性
 
 ### 1.1 实际扫描范围

@@ -12,7 +12,9 @@ from typing import Any, Literal
 from python_agent.approval.service import ApprovalService
 from python_agent.config import AgentPreset
 from python_agent.core.inbox import UserMessage
+from python_agent.core.lifecycle import TaskStatus, task_status_for_finish_reason
 from python_agent.core.limits import BudgetExceededError, BudgetViolation, TurnBudget
+from python_agent.errors import ModelError
 from python_agent.ids import new_message_id
 from python_agent.llm.adapter import ModelAdapter, ModelRouter
 from python_agent.llm.retry import (
@@ -58,6 +60,12 @@ class RunResult:
         """返回字符串形式的 Session ID，方便 CLI、日志和 JSON 序列化。"""
 
         return str(self.session.id)
+
+    @property
+    def task_status(self) -> TaskStatus:
+        """把 Turn 终止原因转换成“最终完成”或“仍需继续”的任务状态。"""
+
+        return task_status_for_finish_reason(self.finish_reason)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +123,14 @@ class AgentLoop:
         self.prompt_assembler = PromptAssembler.default()
         self.system_prompt = system_prompt or self.prompt_assembler.assemble()
         self.excluded_paths = tuple(path.expanduser().resolve() for path in excluded_paths)
+        self.approval_service = approval_service
+        self.approval_required = frozenset(
+            self.config.approval_required if approval_required is None else approval_required
+        )
+        self.spill_directory = spill_directory
+        self.pre_policies = tuple(pre_policies)
+        self.execute_policies = tuple(execute_policies)
+        self.post_policies = tuple(post_policies)
         self.cancel_event = asyncio.Event()
         self._runtime = ToolRuntime(
             self.tools,
@@ -122,9 +138,7 @@ class AgentLoop:
             max_parallel_tools=self.config.max_parallel_tools,
             spill_directory=spill_directory,
             approval_service=approval_service,
-            approval_required=(
-                self.config.approval_required if approval_required is None else approval_required
-            ),
+            approval_required=self.approval_required,
             pre_policies=pre_policies,
             execute_policies=execute_policies,
             post_policies=post_policies,
@@ -243,19 +257,31 @@ class AgentLoop:
 
         stream = getattr(adapter, "stream", None)
         if not callable(stream):
-            response = await adapter.complete(request, cancel_event=self.cancel_event)
-            return response, False
+            raw_response = await adapter.complete(request, cancel_event=self.cancel_event)
+            response = (
+                raw_response
+                if isinstance(raw_response, AssistantResponse)
+                else AssistantResponse.model_validate(raw_response)
+            )
+            return self._safe_response(response), False
 
         content_parts: list[str] = []
         tool_calls: list[ToolCall] = []
-        finish_reason: Literal["stop", "tool_calls", "length", "error"] = "stop"
+        tool_call_positions: dict[str, int] = {}
+        finish_reason: Literal["stop", "tool_calls", "length", "error"] | None = None
         usage = Usage()
+        saw_done = False
+        saw_finish_reason = False
+        chunk_count = 0
         async for raw_chunk in stream(request, cancel_event=self.cancel_event):
+            if saw_done:
+                raise ModelError("LLM_MALFORMED_RESPONSE: stream emitted data after done")
             chunk = (
                 raw_chunk
                 if isinstance(raw_chunk, ModelChunk)
                 else ModelChunk.model_validate(raw_chunk)
             )
+            chunk_count += 1
             if chunk.content:
                 content_parts.append(chunk.content)
                 await self._emit(
@@ -263,11 +289,36 @@ class AgentLoop:
                     {"turn": turn, "step": step, "content": chunk.content},
                 )
             if chunk.tool_calls:
-                tool_calls = chunk.tool_calls
+                # 适配器可能在多个分片中发出完整调用。保留首次出现顺序，重复 call id 则使用
+                # 最新的完整值替换。
+                for call in chunk.tool_calls:
+                    call_id = str(call.id)
+                    position = tool_call_positions.get(call_id)
+                    if position is None:
+                        tool_call_positions[call_id] = len(tool_calls)
+                        tool_calls.append(call)
+                    else:
+                        tool_calls[position] = call
             if chunk.finish_reason is not None:
                 finish_reason = chunk.finish_reason
+                saw_finish_reason = True
             if chunk.usage is not None:
                 usage = chunk.usage
+            if chunk.done:
+                saw_done = True
+        if not saw_done:
+            raise ModelError(
+                "LLM_STREAM_CLOSED: model stream ended without a terminal chunk "
+                f"after {chunk_count} chunks"
+            )
+        if not saw_finish_reason or finish_reason is None:
+            raise ModelError("LLM_MALFORMED_RESPONSE: terminal stream chunk has no finish_reason")
+        if finish_reason == "error":
+            raise ModelError("LLM_PROVIDER_ERROR: provider returned finish_reason=error")
+        # 达到长度上限的响应可能包含语法上看似完整的工具调用前缀；即使自定义适配器提供了
+        # ToolCall 数据，也绝不能执行。
+        if finish_reason == "length":
+            tool_calls = []
         response = AssistantResponse(
             content="".join(content_parts) or None,
             tool_calls=tool_calls,
@@ -275,6 +326,16 @@ class AgentLoop:
             usage=usage,
         )
         return response, True
+
+    @staticmethod
+    def _safe_response(response: AssistantResponse) -> AssistantResponse:
+        """为只支持完整响应的适配器应用与流式适配器相同的不可执行保护。"""
+
+        if response.finish_reason == "error":
+            raise ModelError("LLM_PROVIDER_ERROR: provider returned finish_reason=error")
+        if response.finish_reason == "length" and response.tool_calls:
+            return response.model_copy(update={"tool_calls": []})
+        return response
 
     async def _request_with_status(
         self,
@@ -520,6 +581,7 @@ class AgentLoop:
                 "step": step,
                 "reason": violation.reason,
                 "message": violation.message,
+                "task_status": "paused",
                 "budget": budget.snapshot().event_data(),
             }
             if step is not None:
@@ -610,6 +672,7 @@ class AgentLoop:
                         step_closed = True
                         return await finish_for_limit(exc.violation, step=step)
 
+                    response = self._safe_response(response)
                     last_answer = response.content or ""
                     assistant_event_data = {
                         "content": response.content,
@@ -780,8 +843,12 @@ class AgentLoop:
                         )
                     raise
 
-            append_turn_end("max_steps")
-            return RunResult(last_answer, self.session, "max_steps")
+            max_steps = BudgetViolation(
+                "max_steps",
+                f"Turn 已达到 max_steps={self.config.max_steps}，尚未生成最终回答；"
+                "请使用 /continue 继续，或提交新任务。",
+            )
+            return await finish_for_limit(max_steps)
         except asyncio.CancelledError:
             append_turn_end("aborted")
             raise

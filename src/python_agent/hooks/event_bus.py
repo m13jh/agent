@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
@@ -18,10 +19,47 @@ class LiveEventBus:
     订阅，适合绑定到 Agent 或应用生命周期。
     """
 
-    def __init__(self) -> None:
-        """创建空订阅表；每个 AgentManager 通常拥有一条作用域内总线。"""
+    def __init__(self, *, observer_timeout_seconds: float = 5.0) -> None:
+        """创建空订阅表。
+
+        观察者只负责诊断或界面展示，不拥有 Agent 正确性的控制权。每个 handler 都会被隔离
+        并设置时限，损坏或卡住的渲染器不能阻止 Driver 回到 idle。将时限设为 ``0`` 可以
+        为明确受信任的进程内观察者关闭超时限制。
+        """
 
         self._handlers: dict[str, list[EventHandler]] = defaultdict(list)
+        if observer_timeout_seconds < 0:
+            raise ValueError("observer_timeout_seconds must be non-negative")
+        self.observer_timeout_seconds = observer_timeout_seconds
+        self._observer_errors: list[dict[str, Any]] = []
+
+    @property
+    def observer_errors(self) -> tuple[dict[str, Any], ...]:
+        """返回观察者失败的快照，不重新发送可能递归的事件。"""
+
+        return tuple(dict(error) for error in self._observer_errors)
+
+    def _record_observer_error(
+        self,
+        event_type: str,
+        handler: EventHandler,
+        exc: BaseException,
+    ) -> None:
+        """保存有界诊断信息，同时不保存原始事件负载。"""
+
+        if len(self._observer_errors) >= 256:
+            del self._observer_errors[:64]
+        handler_name = getattr(handler, "__qualname__", None)
+        if not isinstance(handler_name, str):
+            handler_name = type(handler).__qualname__
+        self._observer_errors.append(
+            {
+                "event_type": event_type,
+                "handler": handler_name,
+                "error_type": type(exc).__name__,
+                "message": str(exc)[:1000],
+            }
+        )
 
     def subscribe(self, event_type: str, handler: EventHandler) -> Callable[[], None]:
         """订阅指定事件，返回一个幂等的取消订阅函数。"""
@@ -52,9 +90,22 @@ class LiveEventBus:
         payload = dict(data or {})
         handlers = [*self._handlers.get(event_type, []), *self._handlers.get("*", [])]
         for handler in handlers:
-            result = handler(event_type, payload)
-            if inspect.isawaitable(result):
-                await result
+            try:
+                result = handler(event_type, payload)
+                if inspect.isawaitable(result):
+                    if self.observer_timeout_seconds:
+                        await asyncio.wait_for(
+                            result,
+                            timeout=self.observer_timeout_seconds,
+                        )
+                    else:
+                        await result
+            except asyncio.CancelledError:
+                # 保留 Agent/Driver 自身的取消语义。普通异常会在下面被隔离；外部取消仍必须
+                # 让所有者退出，以便执行自身的清理流程。
+                raise
+            except Exception as exc:
+                self._record_observer_error(event_type, handler, exc)
 
     def emit_sync(self, event_type: str, data: dict[str, Any] | None = None) -> None:
         """在同步的 Session.append 回调中通知同步监听器。
@@ -66,6 +117,15 @@ class LiveEventBus:
         payload = dict(data or {})
         handlers = [*self._handlers.get(event_type, []), *self._handlers.get("*", [])]
         for handler in handlers:
-            result = handler(event_type, payload)
-            if inspect.isawaitable(result):
-                result.close() if inspect.iscoroutine(result) else None
+            try:
+                result = handler(event_type, payload)
+                if inspect.isawaitable(result):
+                    if inspect.iscoroutine(result):
+                        result.close()
+                    self._record_observer_error(
+                        event_type,
+                        handler,
+                        RuntimeError("async observer cannot run from emit_sync"),
+                    )
+            except Exception as exc:
+                self._record_observer_error(event_type, handler, exc)

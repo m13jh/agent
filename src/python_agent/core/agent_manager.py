@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
@@ -14,10 +16,12 @@ from python_agent.hooks.event_bus import LiveEventBus
 from python_agent.ids import SessionId, new_session_id
 from python_agent.llm.adapter import ModelAdapter, ModelRouter
 from python_agent.llm.retry import ModelRetryPolicy
+from python_agent.prompt.assembler import PromptAssembler
 from python_agent.session.events import SessionHeader
 from python_agent.session.session import Session
 from python_agent.session.store import SessionStore
 from python_agent.subagents.manager import SubagentManager
+from python_agent.tools.definition import ToolCapabilities
 from python_agent.tools.policies import ExecuteHandler, PostHandler, PreHandler
 from python_agent.tools.registry import ToolRegistry
 
@@ -63,6 +67,76 @@ class AgentManager:
                 paths.append(resolved)
         return tuple(paths)
 
+    @staticmethod
+    def _capability_fingerprint(
+        config: AgentPreset,
+        tools: ToolRegistry | None,
+        *,
+        system_prompt: str | None,
+        workspace: Path | None,
+        excluded_paths: tuple[Path, ...],
+        approval_service: ApprovalService | None,
+        approval_required: set[str] | frozenset[str] | None,
+        spill_directory: Path | None,
+        pre_policies: tuple[PreHandler, ...],
+        execute_policies: tuple[ExecuteHandler, ...],
+        post_policies: tuple[PostHandler, ...],
+        request_retry_policy: ModelRetryPolicy | None,
+    ) -> str:
+        """对恢复相关能力计算指纹，但不序列化密钥或可调用对象本身。"""
+
+        required = config.approval_required if approval_required is None else approval_required
+        tool_capabilities: dict[str, dict[str, object]] = {}
+        if tools is not None:
+            for name in tools.names():
+                raw_capabilities = getattr(tools.get(name), "capabilities", None)
+                capabilities = (
+                    raw_capabilities
+                    if isinstance(raw_capabilities, ToolCapabilities)
+                    else ToolCapabilities()
+                )
+                tool_capabilities[name] = {
+                    "read_only": capabilities.read_only,
+                    "destructive": capabilities.destructive,
+                    "open_world": capabilities.open_world,
+                    "concurrency_safe": capabilities.concurrency_safe,
+                    "requires_approval": capabilities.requires_approval,
+                    "interrupt_behavior": capabilities.interrupt_behavior,
+                }
+        payload = {
+            "config": config.model_dump(mode="json"),
+            "tools": tools.schemas() if tools is not None else [],
+            "tool_capabilities": tool_capabilities,
+            "system_prompt": system_prompt or PromptAssembler.default().assemble(),
+            "workspace": str(workspace) if workspace is not None else None,
+            "excluded_paths": sorted(str(path.expanduser().resolve()) for path in excluded_paths),
+            "approval_service": (
+                f"{type(approval_service).__module__}.{type(approval_service).__qualname__}"
+                if approval_service is not None
+                else None
+            ),
+            "approval_required": sorted(required),
+            "spill_directory": (
+                str(spill_directory.expanduser().resolve()) if spill_directory is not None else None
+            ),
+            "pre_policies": [type(policy).__qualname__ for policy in pre_policies],
+            "execute_policies": [type(policy).__qualname__ for policy in execute_policies],
+            "post_policies": [type(policy).__qualname__ for policy in post_policies],
+            "retry_policy": (
+                f"{type(request_retry_policy).__module__}.{type(request_retry_policy).__qualname__}"
+                if request_retry_policy is not None
+                else None
+            ),
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
     async def create(
         self,
         adapter: ModelAdapter | ModelRouter,
@@ -91,7 +165,22 @@ class AgentManager:
         """
 
         resolved_config = config or AgentPreset()
+        resolved_exclusions = self._infrastructure_exclusions(excluded_paths)
         if session is None:
+            fingerprint = self._capability_fingerprint(
+                resolved_config,
+                tools,
+                system_prompt=system_prompt,
+                workspace=workspace or resolved_config.workspace,
+                excluded_paths=resolved_exclusions,
+                approval_service=approval_service,
+                approval_required=approval_required,
+                spill_directory=spill_directory,
+                pre_policies=pre_policies,
+                execute_policies=execute_policies,
+                post_policies=post_policies,
+                request_retry_policy=request_retry_policy,
+            )
             header = SessionHeader(
                 id=new_session_id(),
                 cwd=workspace or resolved_config.workspace,
@@ -99,12 +188,33 @@ class AgentManager:
                 origin=origin,
                 delegation_depth=delegation_depth,
                 agent_preset=resolved_config.id,
+                capability_fingerprint=fingerprint,
             )
             session = (
                 await self.session_store.create(header)
                 if self.session_store is not None
                 else Session(header)
             )
+        elif session.header.capability_fingerprint is not None:
+            actual_fingerprint = self._capability_fingerprint(
+                resolved_config,
+                tools,
+                system_prompt=system_prompt,
+                workspace=session.header.cwd,
+                excluded_paths=resolved_exclusions,
+                approval_service=approval_service,
+                approval_required=approval_required,
+                spill_directory=spill_directory,
+                pre_policies=pre_policies,
+                execute_policies=execute_policies,
+                post_policies=post_policies,
+                request_retry_policy=request_retry_policy,
+            )
+            if actual_fingerprint != session.header.capability_fingerprint:
+                raise ConfigurationError(
+                    f"session {session.id} capability fingerprint does not match; "
+                    "create with the original tools, permissions and policies"
+                )
 
         agent = Agent(
             adapter,
@@ -113,7 +223,7 @@ class AgentManager:
             session=session,
             system_prompt=system_prompt,
             workspace=workspace,
-            excluded_paths=self._infrastructure_exclusions(excluded_paths),
+            excluded_paths=resolved_exclusions,
             event_bus=self.event_bus,
             approval_service=approval_service,
             approval_required=approval_required,
@@ -140,6 +250,7 @@ class AgentManager:
                 "agent_id": str(agent.id),
                 "session_id": str(agent.session.id),
                 "status": agent.status,
+                "task_status": agent.task_status,
             },
         )
 
@@ -234,6 +345,27 @@ class AgentManager:
             raise ConfigurationError("AgentManager.resume requires a SessionStore")
         session = await self.session_store.load(session_id, repair=repair)
         resolved_config = self._resolve_resume_config(session, config)
+        resolved_exclusions = self._infrastructure_exclusions(excluded_paths)
+        if session.header.capability_fingerprint is not None:
+            actual_fingerprint = self._capability_fingerprint(
+                resolved_config,
+                tools,
+                system_prompt=system_prompt,
+                workspace=session.header.cwd,
+                excluded_paths=resolved_exclusions,
+                approval_service=approval_service,
+                approval_required=approval_required,
+                spill_directory=spill_directory,
+                pre_policies=pre_policies,
+                execute_policies=execute_policies,
+                post_policies=post_policies,
+                request_retry_policy=request_retry_policy,
+            )
+            if actual_fingerprint != session.header.capability_fingerprint:
+                raise ConfigurationError(
+                    f"session {session.id} capability fingerprint does not match; "
+                    "resume with the original tools, permissions and policies"
+                )
         agent = Agent(
             adapter,
             tools,
@@ -242,7 +374,7 @@ class AgentManager:
             system_prompt=system_prompt,
             # workspace 必须来自持久化 Header，不能由恢复调用悄悄扩大。
             workspace=session.header.cwd,
-            excluded_paths=self._infrastructure_exclusions(excluded_paths),
+            excluded_paths=resolved_exclusions,
             event_bus=self.event_bus,
             approval_service=approval_service,
             approval_required=approval_required,

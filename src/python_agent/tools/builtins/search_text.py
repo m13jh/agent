@@ -11,7 +11,9 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from python_agent.tools.builtins._file_transaction import FileTransaction
 from python_agent.tools.builtins._paths import safe_path, should_hide_path, workspace_root
+from python_agent.tools.definition import ToolCapabilities
 from python_agent.tools.types import ToolContext
 
 
@@ -35,6 +37,13 @@ class SearchTextTool:
         "additionalProperties": False,
     }
     timeout_seconds: float | None = 20.0
+    capabilities = ToolCapabilities(
+        read_only=True,
+        destructive=False,
+        open_world=False,
+        concurrency_safe=True,
+        requires_approval=False,
+    )
 
     def is_concurrency_safe(self, arguments: dict[str, Any]) -> bool:
         """搜索只读取文件和进程输出，不改变 workspace 状态。"""
@@ -45,6 +54,7 @@ class SearchTextTool:
         """校验搜索路径后选择 rg 子进程或 Python 回退实现。"""
 
         query = arguments["query"]
+        FileTransaction.recover_pending(context.workspace or Path.cwd())
         root = safe_path(arguments.get("path", "."), context)
         maximum = min(arguments.get("max_results", 100), 200)
         if shutil.which("rg"):

@@ -26,8 +26,16 @@
 ~~~text
 ruff：通过
 mypy：通过
-pytest：92 passed
+pytest：106 passed
 ~~~
+
+### 1.2 2026-09-01 P0 边界修复（已合并到当前源码）
+
+本轮已补齐并加入回归测试：通用流终止帧与 `length` 工具执行闸门、EventBus 观察者隔离、
+bubblewrap Bash containment、`FileTransaction` 多文件 staging/回滚/崩溃恢复、ToolResult
+JSON-safe 归一化、ToolCapabilities fail-closed 默认、child 能力继承、fork lineage 重置和
+同步 child 结果去重。新增 P0 回归测试后全量为 106 passed；下方原始问题记录保留为审计
+背景，已完成条目不再表示当前实现仍未修复。
 
 以下功能属于架构文档后续阶段，本文不把它们误记为当前缺陷：
 

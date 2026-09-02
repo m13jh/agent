@@ -354,7 +354,8 @@ class FullScreenTerminalUI:
         return [
             (
                 "class:status",
-                f" manual mode on · {self.agent.status} · queued {queued} · "
+                f" manual mode on · {self.agent.status} · task {self.agent.task_status} · "
+                f"queued {queued} · "
                 f"/help · Ctrl+D exit{scroll}",
             )
         ]
@@ -744,6 +745,7 @@ class FullScreenTerminalUI:
             ("/steer 内容", "下一个 Step 纠偏"),
             ("/inject 内容", "静默写入上下文"),
             ("/cancel [keep]", "取消；可选择保留 Inbox"),
+            ("/continue", "继续上一个暂停任务"),
             ("/status", "Agent/队列/请求状态"),
             ("/transcript", "Session 审计记录"),
             ("/tools", "展开/折叠全部工具输出"),
@@ -760,6 +762,7 @@ class FullScreenTerminalUI:
 
         self._append("▌ Status")
         self._append(f"    status      {agent.status}")
+        self._append(f"    task        {agent.task_status}")
         self._append(f"    next_turn   {len(agent.inbox.pending('next_turn'))}")
         self._append(f"    next_step   {len(agent.inbox.pending('next_step'))}")
         expanded = sum(block.expanded for block in self._tools_by_id.values())
@@ -878,7 +881,10 @@ class FullScreenTerminalUI:
         elif event_type == "tool/result":
             self._record_tool_result(data)
         elif event_type == "agent/limit":
-            self._append(f"■ budget · {data.get('reason')} · {data.get('message')}")
+            if data.get("reason") == "max_steps":
+                self._append(f"■ 任务已暂停 · {data.get('message')}")
+            else:
+                self._append(f"■ budget · {data.get('reason')} · {data.get('message')}")
         elif event_type == "agent/error":
             self._append(f"■ {data.get('error_type')}: {data.get('message')}")
         elif event_type == "subagent/created":

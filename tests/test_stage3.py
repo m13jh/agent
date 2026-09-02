@@ -5,7 +5,7 @@ from python_agent.approval.service import CallbackApprovalService
 from python_agent.ids import SessionId
 from python_agent.llm.types import ToolCall
 from python_agent.tools.builtins import ApplyPatchTool, BashTool, WriteFileTool
-from python_agent.tools.definition import FunctionTool
+from python_agent.tools.definition import FunctionTool, ToolCapabilities
 from python_agent.tools.policies import ToolInvocation, ToolResultEnvelope
 from python_agent.tools.registry import ToolRegistry
 from python_agent.tools.runtime import ToolRuntime
@@ -55,6 +55,15 @@ def _context(workspace: Path, *, writable: bool = False) -> ToolContext:
     )
 
 
+_READ_ONLY_CAPABILITIES = ToolCapabilities(
+    read_only=True,
+    destructive=False,
+    open_world=False,
+    concurrency_safe=False,
+    requires_approval=False,
+)
+
+
 async def test_write_and_apply_patch_tools_use_workspace_write_mode(tmp_path: Path) -> None:
     """验证完整写入和结构化补丁都能在 workspace-write 模式完成。"""
 
@@ -98,6 +107,7 @@ async def test_workspace_policy_rejects_before_tool_body(tmp_path: Path) -> None
             "required": ["path"],
         },
         body=body,
+        capabilities=_READ_ONLY_CAPABILITIES,
     )
     result = await ToolRuntime(ToolRegistry([tool])).execute(
         ToolCall(id="outside", name="read_file", arguments={"path": "../secret.txt"}),
@@ -161,6 +171,7 @@ async def test_tool_timeout_becomes_error_result(tmp_path: Path) -> None:
         parameters={"type": "object"},
         body=slow_body,
         timeout_seconds=0.001,
+        capabilities=_READ_ONLY_CAPABILITIES,
     )
     result = await ToolRuntime(ToolRegistry([tool])).execute(
         ToolCall(id="slow", name="slow", arguments={}),
@@ -214,6 +225,7 @@ async def test_pre_execute_post_waterfalls_run_in_order(tmp_path: Path) -> None:
         description="test",
         parameters={"type": "object"},
         body=body,
+        capabilities=_READ_ONLY_CAPABILITIES,
     )
     result = await ToolRuntime(
         ToolRegistry([tool]),
@@ -245,6 +257,7 @@ async def test_long_result_is_spilled_and_model_receives_summary(tmp_path: Path)
         description="test",
         parameters={"type": "object"},
         body=lambda arguments, context: "x" * 40,
+        capabilities=_READ_ONLY_CAPABILITIES,
     )
     result = await ToolRuntime(
         ToolRegistry([tool]),

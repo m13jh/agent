@@ -10,7 +10,12 @@ from python_agent.approval.service import ApprovalService
 from python_agent.config import AgentPreset
 from python_agent.core.agent_loop import AgentLoop, ModelRequestStatus, RunResult
 from python_agent.core.inbox import Inbox, UserMessage
-from python_agent.core.lifecycle import AgentStatus, CancelCause
+from python_agent.core.lifecycle import (
+    AgentStatus,
+    CancelCause,
+    TaskStatus,
+    task_status_for_finish_reason,
+)
 from python_agent.hooks.event_bus import LiveEventBus
 from python_agent.ids import MessageId, SessionId
 from python_agent.llm.adapter import ModelAdapter, ModelRouter
@@ -19,6 +24,11 @@ from python_agent.session.events import SessionEvent
 from python_agent.session.session import Session
 from python_agent.tools.policies import ExecuteHandler, PostHandler, PreHandler
 from python_agent.tools.registry import ToolRegistry
+
+_CONTINUE_PROMPT = (
+    "继续执行上一个因执行限制而暂停的任务。请从当前对话和工具结果继续，"
+    "不要重复已经完成的工作，并在完成后给出最终答案。"
+)
 
 
 class Agent:
@@ -90,6 +100,7 @@ class Agent:
         self._idle_event = asyncio.Event()
         self._idle_event.set()
         self._last_result: RunResult | None = None
+        self._task_status: TaskStatus = self._infer_task_status(self.session)
         self._driver_error: Exception | None = None
         self._disposed = False
 
@@ -104,6 +115,12 @@ class Agent:
         """返回公开生命周期状态，只暴露 idle 或 running。"""
 
         return self._status
+
+    @property
+    def task_status(self) -> TaskStatus:
+        """返回最近任务结果，不把 Driver 的 idle 误报成任务已完成。"""
+
+        return self._task_status
 
     @property
     def last_result(self) -> RunResult | None:
@@ -154,6 +171,23 @@ class Agent:
         self._ensure_not_disposed()
         return self.inbox.append(message, "inject")
 
+    async def continue_task(self) -> MessageId:
+        """继续最近一个因执行限制暂停、但尚未生成最终答案的任务。
+
+        继续动作会作为明确的 followup 事件进入 Inbox，并在新 Turn 中带着既有 Session
+        上下文重新请求模型。这样恢复动作本身也能被持久化和审计，同时不会复制原始任务
+        文本或偷偷绕过单 Driver 规则。
+        """
+
+        self._ensure_not_disposed()
+        if self._status == "running":
+            raise RuntimeError("cannot continue a task while the Agent is running")
+        if self._task_status != "paused":
+            raise RuntimeError("there is no paused task to continue")
+        message_id = self.inbox.append(_CONTINUE_PROMPT, "followup")
+        await self._ensure_driver()
+        return message_id
+
     async def resume_pending(self) -> None:
         """恢复进程重启前仍在 Inbox 中的可唤醒工作。
 
@@ -178,6 +212,7 @@ class Agent:
         task = self._driver_task
         if task is not None and not task.done():
             # 先设置协作式信号，再取消 Driver 的 await，让 when_idle 可以尽快收敛。
+            self._task_status = "cancelled"
             task.cancel()
             await asyncio.shield(task)
         await self.event_bus.emit(
@@ -185,6 +220,7 @@ class Agent:
             {
                 "agent_id": str(self.id),
                 "status": self._status,
+                "task_status": self._task_status,
                 "cancel": cause.model_dump(mode="json"),
             },
         )
@@ -215,7 +251,12 @@ class Agent:
         self._disposed = True
         await self.event_bus.emit(
             "agent/status",
-            {"agent_id": str(self.id), "status": "idle", "disposed": True},
+            {
+                "agent_id": str(self.id),
+                "status": "idle",
+                "task_status": self._task_status,
+                "disposed": True,
+            },
         )
 
     async def _ensure_driver(self) -> None:
@@ -237,11 +278,15 @@ class Agent:
         """单一 Driver 主循环：一个 Turn 结束后继续处理队列中的下一个唤醒消息。"""
 
         self._status = "running"
-        await self.event_bus.emit(
-            "agent/status",
-            {"agent_id": str(self.id), "status": self._status},
-        )
         try:
+            await self.event_bus.emit(
+                "agent/status",
+                {
+                    "agent_id": str(self.id),
+                    "status": self._status,
+                    "task_status": self._task_status,
+                },
+            )
             while self.inbox.has_wakeup_pending:
                 wake_message = self.inbox.claim_idle_wakeup()
                 if wake_message is None:
@@ -253,25 +298,40 @@ class Agent:
                     wake_message,
                     step_input_provider=self.inbox.claim_next_step,
                 )
+                self._task_status = self._last_result.task_status
         except asyncio.CancelledError:
             # cancel() 已经设置取消信号；这里吞掉 Task 取消，让 Driver 正常回到 idle。
+            self._task_status = "cancelled"
             self._driver_error = None
         except Exception as exc:
+            self._task_status = "error"
             self._driver_error = exc
-            await self.event_bus.emit(
-                "agent/error",
-                {
-                    "agent_id": str(self.id),
-                    "error_type": type(exc).__name__,
-                    "message": str(exc),
-                },
-            )
+            try:
+                await self.event_bus.emit(
+                    "agent/error",
+                    {
+                        "agent_id": str(self.id),
+                        "error_type": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                )
+            except asyncio.CancelledError:
+                # 原始 Driver 错误仍然是权威结果；取消会继续进入下面的 finally 清理流程。
+                pass
         finally:
             self._status = "idle"
-            await self.event_bus.emit(
-                "agent/status",
-                {"agent_id": str(self.id), "status": self._status},
-            )
+            try:
+                await self.event_bus.emit(
+                    "agent/status",
+                    {
+                        "agent_id": str(self.id),
+                        "status": self._status,
+                        "task_status": self._task_status,
+                    },
+                )
+            except asyncio.CancelledError:
+                # 被取消的观察者不能阻止 idle 事件发出。
+                pass
             # 必须在最后一次 await 之后再唤醒 when_idle，确保观察者完成后 Driver Task
             # 已经真正返回，避免 when_idle 误判为未收敛并错过下一次唤醒。
             self._idle_event.set()
@@ -296,6 +356,18 @@ class Agent:
 
         if self._disposed and not allow_disposed:
             raise RuntimeError(f"agent {self.id} is disposed")
+
+    @staticmethod
+    def _infer_task_status(session: Session) -> TaskStatus:
+        """从最近一个持久化 Turn 终止原因恢复任务状态。"""
+
+        for event in reversed(session.events):
+            if event.type != "turn/end":
+                continue
+            reason = event.data.get("reason")
+            if isinstance(reason, str):
+                return task_status_for_finish_reason(reason)
+        return "completed"
 
 
 AgentHandle = Agent

@@ -10,6 +10,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict
 
 from python_agent.ids import CallId, SessionId
+from python_agent.tools.serialization import to_json_safe
 
 
 @dataclass(slots=True)
@@ -65,7 +66,9 @@ class ToolResult(BaseModel):
         return {
             "call_id": str(self.call_id),
             "name": self.name,
-            "content": self.content,
+            # Runtime 的 Post 阶段通常已经完成归一化。这里仍在事件边界再次保护，覆盖直接
+            # 构造 ToolResult 或在测试中绕过 Runtime 的调用方。
+            "content": to_json_safe(self.content),
             "is_error": self.is_error,
             "concludes_turn": self.concludes_turn,
         }

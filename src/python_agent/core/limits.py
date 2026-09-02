@@ -14,7 +14,7 @@ from python_agent.config import AgentPreset
 from python_agent.errors import AgentLimitError
 from python_agent.llm.types import Usage
 
-LimitReason = Literal["token_budget", "cost_budget", "wall_time"]
+LimitReason = Literal["max_steps", "token_budget", "cost_budget", "wall_time"]
 
 
 @dataclass(frozen=True, slots=True)

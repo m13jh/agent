@@ -86,10 +86,17 @@ def _display_event(event_type: str, data: dict[str, Any]) -> None:
         )
         return
     if event_type == "agent/limit":
-        print(
-            f"\n[预算终止] {data.get('reason')}：{data.get('message')}",
-            flush=True,
-        )
+        reason = data.get("reason")
+        if reason == "max_steps":
+            print(
+                f"\n[任务暂停] {data.get('message')}",
+                flush=True,
+            )
+        else:
+            print(
+                f"\n[预算终止] {reason}：{data.get('message')}",
+                flush=True,
+            )
         return
     if event_type == "subagent/created":
         print(
@@ -601,6 +608,7 @@ def _print_chat_help(ui: TerminalUI | None = None) -> None:
   /inject 内容      写入上下文但不唤醒 idle Agent
   /cancel           取消当前执行并清空待处理输入
   /cancel keep      取消当前执行但保留 Inbox
+  /continue         继续上一个因执行限制暂停的任务
   /status           查看 Agent 状态和 Inbox
   /transcript       查看当前 Session transcript
   /tools            展开或折叠工具参数、命令和结果
@@ -624,6 +632,7 @@ _CHAT_COMPLETER = WordCompleter(
         "/wait",
         "/cancel",
         "/cancel keep",
+        "/continue",
         "/steer",
         "/inject",
         "/exit",
@@ -711,6 +720,20 @@ async def _dispatch_chat_line(
         else:
             _chat_output(ui, "[已取消] 当前执行已停止，待处理 Inbox 已清空。", style="yellow")
         return False
+    if line == "/continue":
+        if agent.status == "running":
+            _chat_output(
+                ui,
+                "[无法继续] Agent 当前仍在运行；请等待结束后再使用 /continue。",
+                style="yellow",
+            )
+            return False
+        if agent.task_status != "paused":
+            _chat_output(ui, "[无法继续] 当前没有因执行限制暂停的任务。", style="yellow")
+            return False
+        await agent.continue_task()
+        _chat_output(ui, "[已提交] 正在继续上一个尚未完成的任务。", style="cyan")
+        return False
     if line == "/status":
         if ui is not None:
             ui.show_status(agent)
@@ -718,6 +741,7 @@ async def _dispatch_chat_line(
         request = agent.active_request
         details = [
             f"状态：{agent.status}",
+            f"任务状态：{agent.task_status}",
             f"next_turn：{len(agent.inbox.pending('next_turn'))} 条",
             f"next_step：{len(agent.inbox.pending('next_step'))} 条",
         ]
@@ -758,11 +782,19 @@ async def _dispatch_chat_line(
         return False
 
     was_running = agent.status == "running"
+    was_paused = not was_running and agent.task_status == "paused"
     await agent.followup(line)
     if was_running:
         pending = len(agent.inbox.pending("next_turn"))
         _chat_output(
             ui, f"[已排队] followup 已保存；next_turn 当前 {pending} 条，当前任务结束后处理。"
+        )
+    elif was_paused:
+        _chat_output(
+            ui,
+            "[新任务] 上一个任务因执行限制暂停，尚未生成最终回答；"
+            "当前已开始新的 Turn，如需继续上一个任务请使用 /continue。",
+            style="yellow",
         )
     else:
         _chat_output(ui, "[已提交] followup 已唤醒 Agent。", style="cyan")

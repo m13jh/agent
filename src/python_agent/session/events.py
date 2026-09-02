@@ -47,6 +47,10 @@ class SessionHeader(BaseModel):
     )
     delegation_depth: int = Field(default=0, ge=0, description="子 Agent 委派深度")
     agent_preset: str | None = Field(default=None, description="恢复时重新组装能力的 preset 名称")
+    capability_fingerprint: str | None = Field(
+        default=None,
+        description="创建时的模型、工具、权限和运行策略快照指纹",
+    )
 
 
 class SessionEvent(BaseModel):

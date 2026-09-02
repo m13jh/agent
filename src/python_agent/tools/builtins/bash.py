@@ -10,7 +10,10 @@ import tempfile
 from typing import Any
 
 from python_agent.errors import ToolError
+from python_agent.tools.builtins._file_transaction import FileTransaction
 from python_agent.tools.builtins._paths import safe_path, workspace_root
+from python_agent.tools.definition import ToolCapabilities
+from python_agent.tools.sandbox import SandboxRunner
 from python_agent.tools.types import ToolContext
 
 
@@ -38,6 +41,18 @@ class BashTool:
     }
     timeout_seconds: float | None = 60.0
     handles_own_timeout = True
+    capabilities = ToolCapabilities(
+        read_only=False,
+        destructive=True,
+        open_world=True,
+        concurrency_safe=False,
+        requires_approval=True,
+    )
+
+    def __init__(self, sandbox_runner: SandboxRunner | None = None) -> None:
+        """创建必须经过操作系统隔离的 Bash 工具。"""
+
+        self.sandbox_runner = sandbox_runner or SandboxRunner()
 
     def is_concurrency_safe(self, arguments: dict[str, Any]) -> bool:
         """Shell 可能读写任意 workspace 状态，默认不允许与其他工具重叠。"""
@@ -54,16 +69,19 @@ class BashTool:
         command = arguments["command"].strip()
         if not command:
             raise ToolError("bash command cannot be empty")
+        FileTransaction.recover_pending(workspace_root(context))
         cwd = safe_path(arguments.get("cwd", "."), context)
         if not cwd.is_dir():
             raise ToolError(f"bash cwd is not a directory: {arguments.get('cwd', '.')}")
-        environment = os.environ.copy()
-        # 子进程不需要读取模型凭据，避免命令环境意外暴露 API Key。
-        for key in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
-            environment.pop(key, None)
-        # 不使用 asyncio.create_subprocess_exec：在部分 WSL/沙箱环境中重复启动异步子进程
-        # 会出现 child watcher 无法收到退出通知的问题。Popen 创建本身很快，stdout/stderr
-        # 改写入临时文件后，下面用异步轮询等待，既不阻塞事件循环，也不留下无主 Task。
+        root = workspace_root(context)
+        launch = self.sandbox_runner.build(
+            command,
+            workspace=root,
+            cwd=cwd,
+            writable=context.permission_mode == "workspace-write",
+        )
+        # Popen 创建本身很快，stdout/stderr 改写入临时文件后，下面用异步轮询等待，既不
+        # 阻塞事件循环，也不留下无主 Task。SandboxRunner 已经清理环境变量并组装 bwrap。
         timeout = self.timeout_seconds if self.timeout_seconds is not None else 60.0
         with (
             tempfile.TemporaryFile(mode="w+b") as stdout_file,
@@ -72,9 +90,8 @@ class BashTool:
             try:
                 # 先创建一个独立进程组，后续 terminate 才能连同命令派生的子进程一起回收。
                 process = subprocess.Popen(
-                    ["bash", "-lc", command],
-                    cwd=str(cwd),
-                    env=environment,
+                    launch.argv,
+                    env=launch.environment,
                     stdin=subprocess.DEVNULL,
                     stdout=stdout_file,
                     stderr=stderr_file,
@@ -99,6 +116,7 @@ class BashTool:
         return {
             "command": command,
             "cwd": str(cwd.relative_to(workspace_root(context))),
+            "sandbox": launch.mode,
             "returncode": returncode,
             "stdout": stdout.decode("utf-8", errors="replace"),
             "stderr": stderr.decode("utf-8", errors="replace"),

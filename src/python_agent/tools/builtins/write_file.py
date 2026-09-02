@@ -7,7 +7,9 @@ import tempfile
 from typing import Any
 
 from python_agent.errors import ToolError
+from python_agent.tools.builtins._file_transaction import FileTransaction
 from python_agent.tools.builtins._paths import safe_path, workspace_root
+from python_agent.tools.definition import ToolCapabilities
 from python_agent.tools.types import ToolContext
 
 
@@ -26,6 +28,13 @@ class WriteFileTool:
         "additionalProperties": False,
     }
     timeout_seconds: float | None = 10.0
+    capabilities = ToolCapabilities(
+        read_only=False,
+        destructive=True,
+        open_world=False,
+        concurrency_safe=False,
+        requires_approval=False,
+    )
 
     def is_concurrency_safe(self, arguments: dict[str, Any]) -> bool:
         """写文件会改变共享 workspace，必须视为 exclusive 工具。"""
@@ -41,6 +50,7 @@ class WriteFileTool:
 
         if context.permission_mode != "workspace-write":
             raise ToolError("write_file requires workspace-write mode")
+        FileTransaction.recover_pending(workspace_root(context))
         path = safe_path(arguments["path"], context)
         if path.exists() and path.is_dir():
             raise ToolError(f"cannot write directory: {arguments['path']}")

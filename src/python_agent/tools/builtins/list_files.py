@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
+from python_agent.tools.builtins._file_transaction import FileTransaction
 from python_agent.tools.builtins._paths import safe_path, should_hide_path
+from python_agent.tools.definition import ToolCapabilities
 from python_agent.tools.types import ToolContext
 
 
@@ -26,6 +29,13 @@ class ListFilesTool:
         "additionalProperties": False,
     }
     timeout_seconds: float | None = 10.0
+    capabilities = ToolCapabilities(
+        read_only=True,
+        destructive=False,
+        open_world=False,
+        concurrency_safe=True,
+        requires_approval=False,
+    )
     _ignored = {
         ".git",
         ".venv",
@@ -47,6 +57,7 @@ class ListFilesTool:
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> list[str]:
         """解析目录、过滤构建缓存并返回最多 max_results 个相对路径。"""
 
+        FileTransaction.recover_pending(context.workspace or Path.cwd())
         root = safe_path(arguments.get("path", "."), context)
         maximum = min(arguments.get("max_results", 100), 500)
         paths: list[str] = []

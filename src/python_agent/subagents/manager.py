@@ -7,7 +7,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from python_agent.config import AgentPreset
 from python_agent.core.agent import Agent
@@ -37,6 +37,7 @@ class _SubagentRecord:
     created_at: datetime = field(default_factory=utc_now)
     submitted_generation: int = 0
     notified_generation: int = 0
+    delivery_modes: dict[int, Literal["sync", "async"]] = field(default_factory=dict)
     work_event: asyncio.Event = field(default_factory=asyncio.Event)
     notification_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     watcher: asyncio.Task[None] | None = None
@@ -142,7 +143,14 @@ class SubagentManager:
             }
         )
 
-    async def start(self, parent: Agent, prompt: str, spec: SubagentSpec) -> SessionId:
+    async def start(
+        self,
+        parent: Agent,
+        prompt: str,
+        spec: SubagentSpec,
+        *,
+        delivery_mode: Literal["sync", "async"] = "async",
+    ) -> SessionId:
         """创建独立 child Session、提交首个 Turn，并立即返回稳定 SessionId。"""
 
         if not prompt.strip():
@@ -190,6 +198,14 @@ class SubagentManager:
             config=child_config,
             system_prompt=system_prompt,
             workspace=parent.session.header.cwd,
+            excluded_paths=parent.loop.excluded_paths,
+            approval_service=parent.loop.approval_service,
+            approval_required=parent.loop.approval_required,
+            spill_directory=parent.loop.spill_directory,
+            pre_policies=parent.loop.pre_policies,
+            execute_policies=parent.loop.execute_policies,
+            post_policies=parent.loop.post_policies,
+            request_retry_policy=parent.loop.request_retry_policy,
             parent_session_id=parent.id,
             origin="subagent",
             delegation_depth=depth,
@@ -212,7 +228,7 @@ class SubagentManager:
             },
         )
         try:
-            await self._submit(record, prompt)
+            await self._submit(record, prompt, delivery_mode=delivery_mode)
         except Exception:
             await self._dispose_record(record)
             raise
@@ -230,21 +246,39 @@ class SubagentManager:
             )
         return record
 
-    async def _submit(self, record: _SubagentRecord, prompt: str) -> MessageId:
+    async def _submit(
+        self,
+        record: _SubagentRecord,
+        prompt: str,
+        *,
+        delivery_mode: Literal["sync", "async"] = "async",
+    ) -> MessageId:
         """提交工作并唤醒长期 watcher；所有 followup 复用 child 自己的 Inbox。"""
 
         message_id = await record.child.followup(prompt)
         record.submitted_generation += 1
+        record.delivery_modes[record.submitted_generation] = delivery_mode
         record.interrupted = False
         record.work_event.set()
         return message_id
 
-    async def followup(self, parent: Agent, child_id: SessionId, prompt: str) -> MessageId:
+    async def followup(
+        self,
+        parent: Agent,
+        child_id: SessionId,
+        prompt: str,
+        *,
+        delivery_mode: Literal["sync", "async"] = "async",
+    ) -> MessageId:
         """只允许直接父级向现有 child 提交新的独立 Turn。"""
 
         if not prompt.strip():
             raise ValueError("subagent followup must be non-empty")
-        return await self._submit(self._owned_record(parent, child_id), prompt)
+        return await self._submit(
+            self._owned_record(parent, child_id),
+            prompt,
+            delivery_mode=delivery_mode,
+        )
 
     async def interrupt(self, parent: Agent, child_id: SessionId) -> None:
         """只允许直接父级取消 child 当前执行并清空其待处理 Inbox。"""
@@ -345,7 +379,8 @@ class SubagentManager:
                     settled.model_dump(mode="json"),
                 )
                 parent = self.agent_manager.maybe_get(record.parent_id)
-                if parent is not None:
+                delivery_mode = record.delivery_modes.pop(generation, "async")
+                if parent is not None and delivery_mode == "async":
                     try:
                         await parent.inject(
                             f"[subagent/result child_id={record.child.id} "
