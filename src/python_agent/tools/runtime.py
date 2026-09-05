@@ -12,6 +12,7 @@ from python_agent.approval.service import ApprovalService
 from python_agent.errors import ToolError
 from python_agent.hooks.waterfall import Waterfall
 from python_agent.llm.types import ToolCall
+from python_agent.tools.delete_policy import DeletePolicyEngine
 from python_agent.tools.policies import (
     ExecuteHandler,
     OutputPolicy,
@@ -44,6 +45,7 @@ class ToolRuntime:
         spill_directory: Path | None = None,
         approval_service: ApprovalService | None = None,
         approval_required: Iterable[str] | None = None,
+        delete_policy_engine: DeletePolicyEngine | None = None,
         pre_policies: Iterable[PreHandler] = (),
         execute_policies: Iterable[ExecuteHandler] = (),
         post_policies: Iterable[PostHandler] = (),
@@ -58,11 +60,13 @@ class ToolRuntime:
         self.max_result_chars = max_result_chars
         self.max_parallel_tools = max(1, max_parallel_tools)
         self.approval_service = approval_service
+        self.delete_policy_engine = delete_policy_engine
         required = frozenset({"bash"} if approval_required is None else approval_required)
         self.pre_waterfall = build_pre_waterfall(
             approval_service,
             required,
             tuple(pre_policies),
+            delete_policy_engine,
         )
         self.execute_waterfall = Waterfall([TimeoutPolicy(), *tuple(execute_policies)])
         self.post_waterfall = Waterfall(
@@ -83,6 +87,8 @@ class ToolRuntime:
 
         if self.approval_service is not None and context.approval_service is None:
             context = replace(context, approval_service=self.approval_service)
+        if self.delete_policy_engine is not None and context.delete_policy is None:
+            context = replace(context, delete_policy=self.delete_policy_engine)
         invocation = ToolInvocation(call=call, tool=tool, context=context)
         try:
             pre_result = await self.pre_waterfall.run(invocation, self._pre_terminal)
@@ -276,4 +282,7 @@ class ToolRuntime:
         )
 
 
-__all__ = ["ToolContext", "ToolResult", "ToolRuntime", "validate_arguments"]
+PolicyGateway = ToolRuntime
+
+
+__all__ = ["PolicyGateway", "ToolContext", "ToolResult", "ToolRuntime", "validate_arguments"]

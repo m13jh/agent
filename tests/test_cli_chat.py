@@ -6,14 +6,18 @@ import asyncio
 
 import pytest
 
+from python_agent.approval.service import ApprovalRequest, InteractiveApprovalService
 from python_agent.cli import _dispatch_chat_line, _display_event, _normalize_chat_line
 from python_agent.config import AgentPreset
 from python_agent.core.agent import Agent
 from python_agent.core.agent_loop import AgentLoop
+from python_agent.ids import CallId, SessionId
 from python_agent.llm.fake_adapter import FakeAdapter
-from python_agent.llm.types import AssistantResponse, ModelRequest
-from python_agent.tools.builtins import EchoTool
+from python_agent.llm.types import AssistantResponse, ModelRequest, ToolCall
+from python_agent.tools.builtins import BashTool, EchoTool
 from python_agent.tools.registry import ToolRegistry
+from python_agent.tools.runtime import ToolRuntime
+from python_agent.tools.types import ToolContext
 
 
 @pytest.mark.parametrize(
@@ -34,6 +38,88 @@ def test_normalize_chat_line_removes_copied_prompts(
     """验证一个或多个误复制提示符被删除，普通文本保持不变。"""
 
     assert _normalize_chat_line(raw) == (expected, removed)
+
+
+async def test_interactive_approval_waits_for_chat_reply() -> None:
+    """交互审批必须暂停工具，直到 chat 输入循环提交明确的 y/n。"""
+
+    requests: list[ApprovalRequest] = []
+    approval = InteractiveApprovalService(requests.append)
+    pending = asyncio.create_task(
+        approval.request(
+            ApprovalRequest(
+                call_id=CallId("approval"),
+                tool_name="bash",
+                arguments={"command": "touch created.txt"},
+                reason="tool bash requires explicit approval",
+            )
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert approval.has_pending is True
+    assert len(requests) == 1
+    assert pending.done() is False
+    assert approval.respond(True) is True
+    assert await pending is True
+
+
+async def test_chat_routes_no_to_interactive_approval(capsys) -> None:
+    """待审批时输入 no 应该消费本地决定，而不是发送一个新的模型 followup。"""
+
+    approval = InteractiveApprovalService(lambda request: None)
+    pending = asyncio.create_task(
+        approval.request(
+            ApprovalRequest(
+                call_id=CallId("approval-no"),
+                tool_name="delete_file",
+                arguments={"path": "important.txt"},
+                reason="existing user file",
+            )
+        )
+    )
+    await asyncio.sleep(0)
+    agent = Agent(FakeAdapter())
+    try:
+        assert await _dispatch_chat_line(agent, "no", approval_service=approval) is False
+        assert await pending is False
+        assert "已拒绝" in capsys.readouterr().out
+    finally:
+        await agent.dispose()
+
+
+async def test_interactive_approval_blocks_real_bash_tool_until_reply(tmp_path, capsys) -> None:
+    """真实 Bash 工具未收到 chat 回复前不得执行，no 后目标文件仍不存在。"""
+
+    approval = InteractiveApprovalService(lambda request: None)
+    context = ToolContext(
+        session_id=SessionId("approval-session"),
+        workspace=tmp_path,
+        permission_mode="workspace-write",
+        permission_level="L1",
+        network_mode="disabled",
+    )
+    task = asyncio.create_task(
+        ToolRuntime(ToolRegistry([BashTool()]), approval_service=approval).execute(
+            ToolCall(
+                id=CallId("approval-bash"),
+                name="bash",
+                arguments={"command": "touch approval_should_not_exist.txt"},
+            ),
+            context,
+        )
+    )
+    await asyncio.sleep(0)
+    agent = Agent(FakeAdapter())
+    try:
+        assert approval.has_pending is True
+        assert await _dispatch_chat_line(agent, "no", approval_service=approval) is False
+        result = await task
+        assert result.is_error is True
+        assert not (tmp_path / "approval_should_not_exist.txt").exists()
+        assert "已拒绝" in capsys.readouterr().out
+    finally:
+        await agent.dispose()
 
 
 async def test_copied_transcript_prompt_is_dispatched_as_local_command(capsys) -> None:

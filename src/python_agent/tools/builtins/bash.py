@@ -7,13 +7,17 @@ import os
 import signal
 import subprocess
 import tempfile
+from pathlib import Path
 from typing import Any
 
 from python_agent.errors import ToolError
 from python_agent.tools.builtins._file_transaction import FileTransaction
 from python_agent.tools.builtins._paths import safe_path, workspace_root
+from python_agent.tools.command_risk import CommandRiskAnalyzer
 from python_agent.tools.definition import ToolCapabilities
-from python_agent.tools.sandbox import SandboxRunner
+from python_agent.tools.delete_policy import DeleteDecision, DeletePolicyEngine
+from python_agent.tools.sandbox import SandboxRunner, SandboxSpec
+from python_agent.tools.task_manifest import TaskFileManifest
 from python_agent.tools.types import ToolContext
 
 
@@ -69,16 +73,103 @@ class BashTool:
         command = arguments["command"].strip()
         if not command:
             raise ToolError("bash command cannot be empty")
-        FileTransaction.recover_pending(workspace_root(context))
+        if not CommandRiskAnalyzer.is_explicit_read_only(command):
+            approved_tools = context.metadata.get("__approved_tool_names__", set())
+            if not isinstance(approved_tools, set) or self.name not in approved_tools:
+                raise ToolError("approval denied: Bash must pass the Policy Gateway")
+            approved_tools.discard(self.name)
+        root = workspace_root(context)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ToolError(f"cannot initialize workspace: {exc}") from exc
+        FileTransaction.recover_pending(root)
         cwd = safe_path(arguments.get("cwd", "."), context)
         if not cwd.is_dir():
             raise ToolError(f"bash cwd is not a directory: {arguments.get('cwd', '.')}")
-        root = workspace_root(context)
+        risk = CommandRiskAnalyzer.analyze(command)
+        if risk.reserved_path:
+            raise ToolError("permission denied: agent infrastructure paths are not available")
+        if risk.host_admin:
+            raise ToolError(
+                "host-admin command denied: ordinary Agent tools cannot modify the host"
+            )
+        if risk.unknown_delete_scope:
+            raise ToolError(
+                "delete denied: Shell deletion target scope is not fully determinable; "
+                "use delete_file/delete_directory with explicit paths"
+            )
+        if risk.delete_paths:
+            engine_candidate = context.delete_policy
+            engine = (
+                engine_candidate
+                if isinstance(engine_candidate, DeletePolicyEngine)
+                else DeletePolicyEngine(
+                    workspace=root,
+                    manifest=context.task_manifest,
+                    approval_service=context.approval_service,
+                )
+            )
+            command_cwd = safe_path(str(arguments.get("cwd", ".")), context)
+            resolved_delete_paths = [
+                path if Path(path).is_absolute() else str(command_cwd / path)
+                for path in risk.delete_paths
+            ]
+            stored = context.metadata.get("__delete_decisions__", {})
+            decision: DeleteDecision | None = None
+            if len(resolved_delete_paths) == 1 and isinstance(stored, dict):
+                candidate = stored.get(str(Path(resolved_delete_paths[0]).resolve()))
+                if isinstance(candidate, DeleteDecision):
+                    decision = candidate
+            if decision is None:
+                decision = await engine.authorize(
+                    resolved_delete_paths,
+                    context=context,
+                    call_id=context.session_id,
+                    tool_name=self.name,
+                    arguments=arguments,
+                    recursive=risk.recursive,
+                    batch=risk.batch,
+                    source="bash",
+                )
+            if not decision.allowed:
+                raise ToolError(decision.reason)
+        manifest = context.task_manifest
+        tracked_paths: list[tuple[Path, bool, bool]] = []
+        if isinstance(manifest, TaskFileManifest):
+            for raw_path in [*risk.created_paths, *risk.generated_dirs]:
+                candidate = Path(raw_path)
+                if candidate.is_absolute() and candidate.parts[:2] == ("/", "workspace"):
+                    candidate = root / Path(*candidate.parts[2:])
+                elif not candidate.is_absolute():
+                    candidate = cwd / candidate
+                try:
+                    candidate = safe_path(str(candidate), context)
+                except ToolError:
+                    continue
+                tracked_paths.append(
+                    (
+                        candidate,
+                        raw_path in risk.generated_dirs,
+                        candidate.exists(),
+                    )
+                )
+        configured_spec = context.sandbox_spec
+        spec = configured_spec if isinstance(configured_spec, SandboxSpec) else None
         launch = self.sandbox_runner.build(
             command,
             workspace=root,
             cwd=cwd,
             writable=context.permission_mode == "workspace-write",
+            network_mode=context.network_mode,
+            setup_scope_approved=bool(context.metadata.get("network_scope_approved", False)),
+            network_broker=(
+                str(context.metadata["network_broker"])
+                if context.metadata.get("network_broker")
+                else None
+            ),
+            network_scope_approved=bool(context.metadata.get("network_scope_approved", False)),
+            spec=spec,
         )
         # Popen 创建本身很快，stdout/stderr 改写入临时文件后，下面用异步轮询等待，既不
         # 阻塞事件循环，也不留下无主 Task。SandboxRunner 已经清理环境变量并组装 bwrap。
@@ -113,10 +204,19 @@ class BashTool:
             stderr = stderr_file.read()
             # 只有进程已经被 poll 观察到结束后才读取输出，临时文件此时不会再增长。
             returncode = process.returncode or 0
+        if isinstance(manifest, TaskFileManifest) and returncode == 0:
+            for path, is_directory, existed_before in tracked_paths:
+                if existed_before or not path.exists():
+                    continue
+                if is_directory and path.is_dir():
+                    manifest.record_generated_dir(path)
+                elif not is_directory and path.is_file():
+                    manifest.record_created(path)
         return {
             "command": command,
             "cwd": str(cwd.relative_to(workspace_root(context))),
             "sandbox": launch.mode,
+            "network_mode": launch.network_mode,
             "returncode": returncode,
             "stdout": stdout.decode("utf-8", errors="replace"),
             "stderr": stderr.decode("utf-8", errors="replace"),

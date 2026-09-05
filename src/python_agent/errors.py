@@ -49,6 +49,14 @@ class ToolValidationError(ToolError):
     """工具参数不符合该工具声明的 JSON Schema 子集。"""
 
 
+class SandboxError(ToolError):
+    """沙箱后端拒绝或无法提供请求的隔离能力。"""
+
+
+class EnvironmentBlocked(SandboxError):
+    """当前操作系统或隔离后端无法提供请求的安全执行环境。"""
+
+
 class AgentLimitError(AgentError):
     """Agent 达到了配置的步骤、Token 或其他执行上限。"""
 

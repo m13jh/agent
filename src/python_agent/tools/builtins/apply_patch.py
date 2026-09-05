@@ -10,6 +10,8 @@ from python_agent.errors import ToolError
 from python_agent.tools.builtins._file_transaction import FileTransaction
 from python_agent.tools.builtins._paths import safe_path, workspace_root
 from python_agent.tools.definition import ToolCapabilities
+from python_agent.tools.delete_policy import DeleteDecision, DeletePolicyEngine
+from python_agent.tools.task_manifest import TaskFileManifest
 from python_agent.tools.types import ToolContext
 
 PatchAction = Literal["add", "update", "delete"]
@@ -66,16 +68,23 @@ class ApplyPatchTool:
         FileTransaction.recover_pending(workspace_root(context))
         operations = self._parse(arguments["patch"])
         changes: list[tuple[Path, bytes | None]] = []
+        delete_targets: list[Path] = []
+        created_directories: list[Path] = []
         for operation in operations:
             path = safe_path(operation.path, context)
             if operation.action == "add":
                 if path.exists():
                     raise ToolError(f"cannot add existing file: {operation.path}")
                 content = self._added_content(operation.lines)
+                cursor = path.parent
+                while not cursor.exists():
+                    created_directories.append(cursor)
+                    cursor = cursor.parent
             elif operation.action == "delete":
                 if not path.is_file():
                     raise ToolError(f"cannot delete missing file: {operation.path}")
-                content = None
+                delete_targets.append(path)
+                continue
             else:
                 if not path.is_file():
                     raise ToolError(f"cannot update missing file: {operation.path}")
@@ -86,10 +95,51 @@ class ApplyPatchTool:
                 content = self._apply_update(original, operation.lines, operation.path)
             changes.append((path, None if content is None else content.encode("utf-8")))
 
-        FileTransaction(workspace_root(context), changes).commit()
+        engine = context.delete_policy
+        if not isinstance(engine, DeletePolicyEngine):
+            engine = DeletePolicyEngine(
+                workspace=workspace_root(context),
+                manifest=context.task_manifest,
+                approval_service=context.approval_service,
+            )
+        delete_decisions: list[DeleteDecision] = []
+        stored = context.metadata.get("__delete_decisions__", {})
+        for path in delete_targets:
+            decision = (
+                stored.get(str(path.expanduser().resolve())) if isinstance(stored, dict) else None
+            )
+            if not isinstance(decision, DeleteDecision):
+                decision = await engine.authorize(
+                    path,
+                    context=context,
+                    call_id=context.session_id,
+                    tool_name=self.name,
+                    arguments=arguments,
+                )
+            if not decision.allowed:
+                raise ToolError(decision.reason)
+            delete_decisions.append(decision)
+
+        if changes:
+            FileTransaction(workspace_root(context), changes).commit()
+        for decision in delete_decisions:
+            engine.execute(
+                decision,
+                task_id=str(context.session_id),
+                context=context,
+            )
+
+        manifest = context.task_manifest
+        if isinstance(manifest, TaskFileManifest):
+            for operation in operations:
+                if operation.action == "add":
+                    path = safe_path(operation.path, context)
+                    manifest.record_created(path)
+            for directory in reversed(created_directories):
+                manifest.record_generated_dir(directory)
         return {
             "files": [operation.path for operation in operations],
-            "changed_files": len(changes),
+            "changed_files": len(changes) + len(delete_targets),
             "workspace": str(workspace_root(context)),
         }
 

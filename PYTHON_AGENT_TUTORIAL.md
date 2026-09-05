@@ -35,13 +35,16 @@
    不代表最近任务已经完成；`task_status` 会区分 `completed`、`paused`、`cancelled` 和
    `error`。
 
-本文已经逐行阅读当前 `src/python_agent` 下的 63 个 Python 文件；之后的“逐文件导读”
+本文已经逐行阅读当前 `src/python_agent` 下的 71 个 Python 文件；之后的“逐文件导读”
 按真实目录逐个说明。为了快速建立整体感觉，建议先读第 1～3 节，再回头查文件。
 
-> **当前实现状态（2026-09-01）**：P0 边界已经落地，包括通用流终止帧与 `length` 执行
+> **当前实现状态（2026-09-03）**：P0 边界已经落地，包括通用流终止帧与 `length` 执行
 > 闸门、EventBus 观察者隔离、bubblewrap Bash containment、`FileTransaction` 文件事务、
 > ToolResult JSON-safe 归一化、ToolCapabilities fail-closed 默认、子 Agent 能力继承、
-> fork lineage 重置和同步 child 结果去重。下面涉及这些机制的章节均按当前源码说明；
+> fork lineage 重置和同步 child 结果去重。另已加入 SANBOX 权限等级、独立网络模式、
+> DeletePolicyEngine、任务生成文件清单、Shell 风险分析和固定 Docker L3 后端。下面涉及
+> 这些机制的章节均按当前源码说明；Shell 还会按受信任启动环境只读挂载当前 Conda/NVM
+> runtime，并在交互式 `chat` 中等待用户处理高风险审批；
 > `IMPROVEMENTS.md` 中的修复前复现仍作为历史背景保留。
 
 ---
@@ -84,13 +87,16 @@ python -m python_agent chat --plain
 python -m python_agent chat
 ```
 
-如果要连接 DeepSeek，在项目根目录准备 `.env`，然后运行：
+如果要连接真实模型，在项目根目录准备 `.env`。当前 CLI 的 `deepseek` provider 使用
+`DeepSeekAdapter` 的 OpenAI-compatible Chat Completions 协议；因此也可以接入遵循该协议的
+其他模型服务，模型名和 Base URL 由环境变量决定。模型名会自动从 `DEEPSEEK_MODEL` 读取，
+不需要在命令行重复传入 `--model`：
 
 ```bash
-python -m python_agent run "检查项目结构" --provider deepseek --model deepseek-chat
+python -m python_agent run "检查项目结构" --provider deepseek
 ```
 
-如果任务需要 Bash，必须显式打开写入权限和审批：
+如果任务需要 Bash，必须显式打开写入权限和审批；网络权限仍然是另一个独立开关：
 
 ```bash
 python -m python_agent run "检查 git 状态" \
@@ -98,6 +104,10 @@ python -m python_agent run "检查 git 状态" \
   --permission-mode workspace-write \
   --approve-bash
 ```
+
+上面的命令默认 `network=disabled`。如果 Bash 命令确实需要联网，还要显式使用
+`--network-mode full --approve-network`；`--approve-bash` 负责 Bash/高风险工具的审批，
+三者不能互相替代。
 
 Bash 会在 bubblewrap 中运行。验证当前终端是否支持网络命名空间时，应把要执行的程序
 一并挂载：
@@ -138,8 +148,10 @@ asyncio.run(main())
 
 ### 1.2 真实模型和沙箱快速验证
 
-确认 `.env` 中已经有 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL` 和可选的
-`DEEPSEEK_MODEL` 后，可以先做不调用工具的真实请求：
+确认 `.env` 中已经有 `DEEPSEEK_API_KEY`、当前兼容服务的 `DEEPSEEK_BASE_URL` 和可选的
+`DEEPSEEK_MODEL` 后，可以先做不调用工具的真实请求。`DEEPSEEK_*` 是本项目适配器的
+环境变量约定；如果 Base URL 指向其他 OpenAI-compatible 服务，Key 和 model 仍必须使用
+该服务匹配的值：
 
 ```bash
 python -m python_agent run "只回复：连接成功，不要调用工具" \
@@ -168,10 +180,146 @@ python -m python_agent run \
   --workspace "$PWD"
 ```
 
-工具结果中的 `sandbox` 字段会显示 `bubblewrap-network` 或
-`bubblewrap-filesystem-restricted`。前者表示网络 namespace 探测成功；后者表示当前
-外层环境不允许网络隔离，程序会启用本地命令白名单。两种模式都会隔离 workspace 外的
-文件；`--approve-bash` 只表示审批通过，不会绕过沙箱。
+如果想观察人工审批，不要传 `--approve-bash`，而是在交互式 `chat` 中使用同样的权限参数：
+
+```bash
+python -m python_agent chat --plain \
+  --provider deepseek \
+  --workspace /tmp/python-agent-real-interactive \
+  --session-root /tmp/python-agent-real-interactive-session \
+  --permission-mode workspace-write \
+  --permission-level L1 \
+  --network-mode disabled
+```
+
+当模型请求执行写入型 Bash、已有文件删除、批量 patch、容器调用或网络 Scope 时，终端会
+显示 `[需要审批]`。输入 `y`/`yes` 批准，输入 `n`/`no` 拒绝；普通文本在待审批期间不会
+被发送给模型。`--approve-bash` 是非交互自动批准开关，所以带上它时不会出现询问。
+
+工具结果中的 `sandbox` 字段可能是 `bubblewrap-network`、
+`bubblewrap-network-enabled` 或旧低层 API 的 `bubblewrap-filesystem-restricted`。
+对 Agent/CLI 显式使用 `network=disabled` 时，如果网络 namespace 不可用会返回
+`environment_blocked`，不会把“受限命令白名单”冒充成严格断网；`network=full` 则保留
+workspace 文件隔离并开启已批准的网络。Bubblewrap 只读挂载 DNS、NSS 和 TLS CA 的最小
+系统文件，不会把宿主整个 `/etc` 暴露给 Agent。任何审批都不会绕过 workspace、容器或
+系统目录边界。
+
+### 1.3 SANBOX 各权限等级的启动命令
+
+下面的命令都不传 `--model`：当前 provider 使用的模型会从项目根目录的 `.env` 中读取
+`DEEPSEEK_MODEL`；如果没有配置，则使用适配器默认值。先进入项目和 conda 环境：
+
+```bash
+cd /home/m13jh/projects/python_project/agent/python-agent
+conda activate agent
+```
+
+每个等级的 `chat` 启动命令如下。示例使用独立的 `/tmp` workspace 和 Session 根目录，
+避免把测试状态混入项目本身：
+
+```bash
+# L0：只读 workspace，不能写文件、执行修改型/联网 Bash；只读 Bash 仍会经过风险分析
+python -m python_agent chat \
+  --provider deepseek \
+  --workspace /tmp/python-agent-real-test \
+  --session-root /tmp/python-agent-real-l0 \
+  --permission-mode read-only \
+  --permission-level L0 \
+  --network-mode disabled
+
+# L1：可写 workspace；Bash 需要额外显式审批；默认仍然断网
+python -m python_agent chat \
+  --provider deepseek \
+  --workspace /tmp/python-agent-real-test \
+  --session-root /tmp/python-agent-real-l1 \
+  --permission-mode workspace-write \
+  --permission-level L1 \
+  --network-mode disabled \
+  --approve-bash
+
+# L2：workspace-write + 已批准的完整外网；Bash 仍需审批
+python -m python_agent chat \
+  --provider deepseek \
+  --workspace /tmp/python-agent-real-test \
+  --session-root /tmp/python-agent-real-l2 \
+  --permission-mode workspace-write \
+  --permission-level L2 \
+  --network-mode full \
+  --approve-network \
+  --approve-bash
+
+# L3：启用固定安全参数的 container_exec；这里显式打开容器网络
+python -m python_agent chat \
+  --provider deepseek \
+  --workspace /tmp/python-agent-real-test \
+  --session-root /tmp/python-agent-real-l3 \
+  --permission-mode workspace-write \
+  --permission-level L3 \
+  --network-mode full \
+  --approve-network \
+  --enable-container \
+  --approve-bash
+
+# L4：宿主管理员能力仍被普通 CLI 拒绝；这里显式打开普通 Bash 网络
+python -m python_agent chat \
+  --provider deepseek \
+  --workspace /tmp/python-agent-real-test \
+  --session-root /tmp/python-agent-real-l4 \
+  --permission-mode workspace-write \
+  --permission-level L4 \
+  --network-mode full \
+  --approve-network \
+  --approve-bash
+```
+
+等级和实际能力的关系是：L0 只读，L1 写入当前 workspace，L2 在 L1 基础上增加网络，
+L3 增加受固定参数约束的容器执行，L4 只表示最高等级能力快照。L2～L4 如果要联网，
+必须把网络模式设为 `full` 并批准 Scope；默认 `disabled` 仍然是安全的断网配置。L4 的宿主机管理员执行
+器必须由受信任的外部工作流注入，`python-agent chat` 不会因为指定 `L4` 就获得
+`sudo`、`mount`、`systemctl` 或修改宿主 `/etc` 的权限。
+
+`--permission-mode` 和 `--network-mode` 是两个独立维度：`read-only` / `workspace-write`
+控制文件系统写权限，`disabled` / `full` 等控制网络 Scope。`--approve-bash` 是本进程对
+Bash 及部分高风险工具的审批回调，`--approve-network` 是短生命周期网络 Scope 批准；
+二者都不会扩大 workspace 边界，也不会绕过容器或操作系统沙箱。
+
+网络模式的当前可用性：
+
+- `disabled`：严格断网；若当前环境不能创建 network namespace，则返回
+  `environment_blocked`，不会偷偷退回宿主网络。
+- `full`：仅 L2 及以上可用，必须同时传 `--approve-network`；Bash/容器还需要
+  `--approve-bash`。workspace 文件隔离仍然保留。
+- `setup-approved`：只给受信任的 setup runner 使用，普通 CLI chat 会拒绝。
+- `allowlist`：需要尚未接入的 broker-backed executor，普通 CLI chat 会拒绝。
+
+L3 运行前需要本机 Docker 和受信任镜像 `agent-runtime:latest`。容器由代码固定使用资源
+限制、`cap-drop=ALL`、`no-new-privileges`、只挂载 `/workspace`；模型只能提交容器内命令，
+不能提交 Docker 参数、宿主路径、Docker socket 或 `--privileged`。如果只是测试网络，使用
+L2；如果只是测试隔离执行，使用 L3 的 `network=disabled` 配置。
+
+交互式审批验证时不要传 `--approve-bash`（它是非交互自动批准开关）。`chat` 默认会在
+Bash、网络 Scope、已有文件删除、批量 patch 或容器调用需要批准时显示摘要；在输入框输入
+`y`/`yes` 批准或 `n`/`no` 拒绝。`run` 没有交互输入循环，未传 `--approve-bash` 时会
+fail closed。
+
+### 1.4 真实模型与执行器验证基线
+
+真实模型只负责产生回答或工具调用；workspace、权限、网络和容器边界由本地 Runtime
+强制执行。下面是每次实现变更后应观察到的判定，不需要把 API Key 写进命令行：
+
+| Profile | 验证动作 | 预期结果 |
+|---|---|---|
+| L0 + `disabled` | 请求 `write_file` 或修改型/联网 Bash | Capability Gateway 拒绝，目标文件不存在 |
+| L1 + `disabled` | 请求 `write_file` 创建 workspace 文件 | 创建成功；网络命令仍被拒绝 |
+| L1 + `disabled` | 查询 `conda`、`cmake`、`java`、`node`、`npm`、`python`、`pytest`、`pip` | 受信任 runtime 可见；workspace 外 Home 内容仍不可见 |
+| L2 + `full` | Bash 执行 `curl -I --max-time 5 https://example.com` | 返回 HTTP 响应，并记录 `bubblewrap-network-enabled` |
+| L3 + `full` | 请求 `container_exec` 执行 Python HTTPS 请求 | 返回容器 stdout/HTTP 响应；网络由 Docker bridge 提供 |
+| L4 + `full` | Bash 执行 HTTPS 请求，再请求 `sudo`/宿主 `/etc` 修改 | 普通网络命令可用；宿主管理员动作仍返回 `host-admin command denied` |
+
+L2/L4 网络探测返回 HTTP 响应即可证明沙箱已经允许网络；具体状态码由目标服务决定，
+例如未认证请求可能返回 401。L3 如果缺少 `agent-runtime:latest`，应先准备受信任镜像，
+不能允许模型自行改变镜像或 Docker 参数。模型 HTTP/SSE 连接错误属于 Provider 配置或
+网络链路问题，应与本地工具执行结果分开诊断。
 
 ---
 
@@ -192,8 +340,10 @@ flowchart TB
     Runtime --> Registry[ToolRegistry]
     Runtime --> Policies[Pre / Execute / Post]
     Policies --> Capabilities[ToolCapabilities]
+    Policies --> Network[Network / Command / Delete policies]
     Policies --> Sandbox[SandboxRunner]
     Policies --> Transaction[FileTransaction]
+    Policies --> Container[ContainerManager]
     Policies --> Serialize[JSON-safe 结果]
     Runtime --> Builtins[内置工具]
     Session --> Projection[derive_messages / transcript]
@@ -216,7 +366,7 @@ flowchart TB
 | Agent 核心 | `core/agent.py`、`agent_loop.py`、`inbox.py` | Driver、Turn/Step、取消、排队 | 不知道 JSONL 的文件细节 |
 | 模型边界 | `llm/*` | 标准请求/响应与 Provider 转换 | 不决定何时执行工具 |
 | 工具边界 | `tools/*` | 注册、能力声明、校验、策略、执行、输出规范化 | 不拥有整个 Agent 生命周期 |
-| 安全执行 | `tools/sandbox.py`、`tools/builtins/_file_transaction.py` | OS 沙箱、命令限制、文件事务和崩溃恢复 | 不决定模型是否需要调用工具 |
+| 安全执行 | `tools/capabilities.py`、`policies.py`、`sandbox.py`、`delete_policy.py`、`container.py` | Capability、网络/命令/删除策略、OS 沙箱、文件事务、容器和崩溃恢复 | 不决定模型是否需要调用工具 |
 | 会话层 | `session/*` | 事件追加、投影、恢复、fork、压缩 | 不调用模型、不执行工具 |
 | 扩展层 | `hooks/*`、`approval/*`、`prompt/*`、`skills/*` | 通知、审批、提示词、Skill | 不越过既有安全边界 |
 
@@ -400,9 +550,9 @@ flowchart TD
 | `session` | 9 | 事件、投影、JSONL、修复、压缩、索引 |
 | `skills` | 4 | 声明式按需 Skill |
 | `subagents` | 4 | 进程内子 Agent 生命周期 |
-| 工具及内置工具 | 18 | Schema、能力、策略、并发、文件、事务和 Bash |
+| 工具及内置工具 | 26 | Schema、能力、策略、并发、文件、事务、Shell、删除、容器和 runtime |
 | TUI / CLI | 2 | 终端展示与命令分发 |
-| **合计** | **63** | 当前 `src` 全量 |
+| **合计** | **71** | 当前 `src` 全量 |
 
 推荐阅读顺序：
 
@@ -451,7 +601,8 @@ ids/errors/config
 - 输入/输出 Token 单价：Provider 不报费用时估算成本。
 - `model_max_retries`、`model_retry_base_delay_seconds`：请求重试。
 - `max_tool_result_chars`：工具结果进入上下文前的字符上限。
-- `workspace`、`tools`、`permission_mode`、`approval_required`：能力和安全边界。
+- `workspace`、`tools`、`permission_mode`、`permission_level`：文件系统和 SANBOX 等级。
+- `network_mode`、`network_scope_approved`、`approval_required`：独立网络 Scope 和高风险审批。
 - `subagents_enabled`、深度/数量限制、`skills_root`：扩展能力。
 
 `load_toml()` 只读取 TOML 数据：Python 3.11 用 `tomllib`，3.10 用 `tomli`；如果存在
@@ -497,8 +648,9 @@ Runtime 会把普通工具异常转换为 `ToolResult(is_error=True)`；模型�
 
 ### 6.1 `src/python_agent/approval/__init__.py`
 
-只负责重新导出 `ApprovalRequest`、`ApprovalService`、`CallbackApprovalService` 和
-`DenyApprovalService`。模块说明明确了审批 UI 不应该写进工具业务代码。
+只负责重新导出 `ApprovalRequest`、`ApprovalService`、`CallbackApprovalService`、
+`InteractiveApprovalService` 和 `DenyApprovalService`。模块说明明确了审批 UI 不应该写进
+工具业务代码。
 
 ### 6.2 `src/python_agent/approval/service.py`
 
@@ -507,9 +659,12 @@ Runtime 会把普通工具异常转换为 `ToolResult(is_error=True)`；模型�
 - `ApprovalService` 是最小异步 Protocol：`request(approval) -> bool`。
 - `DenyApprovalService` 是 fail-closed 默认实现，没有明确能力就拒绝。
 - `CallbackApprovalService` 适配同步或异步回调，使用 `inspect.isawaitable` 统一处理。
+- `InteractiveApprovalService` 把请求排队并显示给 chat UI，等待主输入循环路由 `y/yes` 或
+  `n/no`；它不自行读取 stdin，因此全屏和纯文本 prompt 不会发生输入竞争。
 
-CLI 的 `--approve-bash` 实际注入一个总返回 `True` 的 Callback；生产 UI 可以把回调
-换成真正的确认对话框。
+CLI 的 `--approve-bash` 注入非交互自动批准 Callback，但不会替代独立的网络 Scope 批准；
+`chat` 不传这个开关时使用 `InteractiveApprovalService`，`run` 没有 stdin 审批循环并保持
+fail closed。
 
 ### 6.3 `src/python_agent/hooks/__init__.py`
 
@@ -757,12 +912,15 @@ Provider 专属逻辑全部收口在这里：
 ### 9.1 `src/python_agent/tools/__init__.py`
 
 导出 `FunctionTool`、`ToolCapabilities`、`ToolDefinition`、`ToolRegistry`、`ToolRuntime`、
-`ToolContext`、`ToolResult`。具体策略和内置工具不在这里自动注册。
+`ToolContext`、`ToolResult`，以及 `PermissionLevel`、`NetworkMode`、`SandboxSpec`、
+`DeletePolicyEngine`、`TaskFileManifest` 和 `ContainerManager` 等安全基础类型。具体策略和
+内置工具不在这里自动注册。
 
 ### 9.2 `src/python_agent/tools/types.py`
 
-- `ToolContext` 是内部执行上下文：Session ID、workspace、取消事件、权限模式、排除
-  路径、审批服务和应用元数据；不会直接发给模型。
+- `ToolContext` 是内部执行上下文：Session ID、workspace、取消事件、权限模式、SANBOX
+  等级、网络模式、Capability 快照、排除路径、任务 manifest、删除策略、审批服务和应用
+  元数据；不会直接发给模型。
 - `ToolResult` 是模型可见的统一结果，含 call_id、name、content、`is_error` 和
   `concludes_turn`。
 - `event_data()` 把它变成 `tool/result` 事件字典。
@@ -826,6 +984,10 @@ min/max、长度、pattern、数组 items 和 minItems/maxItems。未知注释�
 ArgumentValidationPolicy
   → WorkspacePathPolicy
   → PermissionPolicy
+  → NetworkPolicy
+  → ModificationRiskPolicy
+  → CommandRiskPolicy
+  → DeletePolicy
   → ApprovalPolicy
   → 自定义 Pre policies
 ```
@@ -833,8 +995,17 @@ ArgumentValidationPolicy
 - `ArgumentValidationPolicy` 失败就短路。
 - `WorkspacePathPolicy` 检查文件工具的 `path`、Bash 的 `cwd` 和 patch 内所有目标
   路径；`safe_path()` 解析符号链接后再检查边界。
-- `PermissionPolicy` 不再按工具名称判断，而是读取 `ToolCapabilities`。read-only 工具应
-  声明 `read_only=True`；未声明能力的自定义工具按危险操作拒绝。
+- `PermissionPolicy` 不再按工具名称判断，而是读取命名 `ToolCapabilities`。read-only 工具
+  应声明 `read_only=True`；未声明能力的自定义工具按危险操作拒绝；L4 的 `host.admin`
+  还必须有受信任的专用执行器，普通 Agent 工具不能直接获得宿主机管理员能力。
+- `NetworkPolicy` 将 `network.internet` 与 filesystem 权限分开处理；`disabled`、
+  `setup-approved`、`allowlist` 和 `full` 各自 fail closed，网络 Scope 需要独立批准。
+- `ModificationRiskPolicy` 对一次覆盖 5 个及以上已有文件的 patch 要求额外审批。
+- `CommandRiskPolicy` 分析 Bash/container 命令中的网络、宿主机管理、保留目录和删除风险，
+  防止通过 Shell 语法绕过更高层工具策略。
+- `DeletePolicy` 把 `delete_file`、`delete_directory`、`apply_patch` 的 Delete 操作以及
+  Bash/container 中的删除统一交给 `DeletePolicyEngine`，区分任务生成临时文件、普通文件、
+  批量删除和敏感/基础设施路径。
 - `ApprovalPolicy` 同时考虑配置中的 `approval_required` 和工具自身的
   `requires_approval`；缺少 service、回调异常或返回 False 都拒绝。
 
@@ -869,21 +1040,39 @@ flowchart LR
 
 ### 9.7 `src/python_agent/tools/builtins/__init__.py`
 
-只导出七个内置工具类：`ReadFileTool`、`ListFilesTool`、`SearchTextTool`、`EchoTool`、
-`WriteFileTool`、`ApplyPatchTool`、`BashTool`。此外，`_file_transaction.py`、`sandbox.py`
-和 `serialization.py` 是内部安全基础设施，不作为内置模型工具直接暴露。工具是否注册和
-是否允许执行由 CLI/Runtime 决定，导入一个类不会自动给模型授权。
+导出九个基础内置工具类：`ReadFileTool`、`ListFilesTool`、`SearchTextTool`、`EchoTool`、
+`WriteFileTool`、`ApplyPatchTool`、`BashTool`、`DeleteFileTool` 和 `DeleteDirectoryTool`。
+启用 `--enable-container` 后，CLI 还会注册 `ContainerExecTool`。此外，
+`_file_transaction.py`、`sandbox.py`、`serialization.py` 等是内部安全基础设施，不作为
+模型工具直接暴露。工具是否注册和是否允许执行由 CLI/Runtime 决定，导入一个类不会自动给
+模型授权。
+
+`DeleteFileTool` 只处理单文件请求，`DeleteDirectoryTool` 负责显式递归目录请求；二者都
+先向 `DeletePolicyEngine` 请求决定。任务 manifest 中登记且被判定为临时产物的路径可以进入
+自动清理流程，普通目标默认进入审批/软删除流程，敏感路径、`.python-agent`、`.agent-trash`
+和 workspace 外路径则拒绝。
 
 ### 9.8 内部安全基础设施：事务、沙箱和序列化
 
-这三个模块不直接作为模型工具暴露，但它们是 P0 安全边界的基础：
+这些模块主要是内部安全基础设施；`ContainerManager` 通过单独的 `ContainerExecTool` 门面
+按需暴露，其他模块不直接作为模型工具暴露。它们共同构成 P0/SANBOX 安全边界：
 
 - `tools/builtins/_file_transaction.py`：为多文件 patch 捕获 hash/mtime 快照，在私有
   暂存目录中准备内容，写入持久化 manifest；提交失败逆序回滚，进程在提交中退出
   时，下一次文件工具操作会恢复未完成事务。
+- `tools/capabilities.py`：集中定义 L0～L4、网络模式和命名 Capability，确保工具名不会
+  代替真实的能力边界。
 - `tools/sandbox.py`：用 bubblewrap 构造只挂载 `/workspace` 的进程命名空间，系统目录只读、
-  `/tmp` 独立；网络 namespace 可用时隔离外网，不可用时启用本地命令白名单，并且找不到
-  bubblewrap 时 fail closed。
+  `/tmp` 独立；Agent 显式使用 `network=disabled` 而无法创建 network namespace 时直接
+  `environment_blocked`，不会回退到宿主网络；`network=full` 只在获批后开启网络。
+- `tools/command_risk.py`：分析嵌套 Shell、网络命令、宿主机路径和删除语法，阻止命令组合
+  绕过策略。
+- `tools/delete_policy.py`、`tools/task_manifest.py`：追踪任务新建文件，并为文件、目录、
+  patch 和 Shell 删除提供统一授权、软删除和审计信息。
+- `tools/container.py`：构造固定镜像、资源限制、cap-drop、workspace-only 挂载和独立网络
+  的 Docker L3 执行命令；容器使用镜像自己的工具链，不继承宿主 Conda/NVM。
+- `tools/runtime_env.py`：启动时发现当前 Python/Conda 环境、NVM Node 和 `/opt` 下的受信任
+  工具目录，仅只读挂载选中的 runtime；宿主 `/home`、`/root` 和根目录本身不会被挂载。
 - `tools/serialization.py`：把 Path、bytes、日期、集合和有限标量转换为严格 JSON-safe
   值，限制递归深度和节点数，避免任意工具结果破坏 Session 事件。
 
@@ -894,9 +1083,11 @@ flowchart LR
 - `workspace_root()`：有 workspace 用其绝对路径，否则使用进程 cwd。
 - `safe_path()`：相对路径相对 workspace，调用 `resolve()` 展开 `..` 和符号链接，再
   `relative_to(root)`；越界、排除目录、敏感路径都抛 `ToolError`。
-- `is_excluded_path()`：排除等于或位于基础设施目录内的路径。
+- `is_excluded_path()`：排除等于或位于基础设施目录内的路径，包括 Session Store、
+  `.python-agent` 和 `.agent-trash`。
 - `is_sensitive_path()`：拒绝 `.env`、`.env.*`（安全示例除外）、`.ssh/.aws/.gnupg/`
-  等目录，以及 `.pem/.key/.p12/.pfx`；`should_hide_path()` 给 list/search 复用。
+  等目录，以及 `.pem/.key/.p12/.pfx`；`should_hide_path()` 给 list/search 复用。符号链
+  接目标也按 resolve 后的真实路径检查。
 
 ### 9.10 `src/python_agent/tools/builtins/echo.py`
 
@@ -928,6 +1119,7 @@ Registry、Runtime 和离线模型闭环最方便的 smoke tool。
 写工具要求 `workspace-write`，即使绕过 Runtime 直接调用也会再次检查。执行前会先恢复
 workspace 中遗留的未完成文件事务；然后在目标目录创建临时文件、写入、flush、fsync，
 再用 `os.replace()` 替换目标，尽量避免中断时留下半文件；返回相对路径和 UTF-8 字节数。
+成功创建的新文件会登记到当前任务的 `TaskFileManifest`，供后续删除策略识别任务临时产物。
 它是 exclusive 工具。
 
 ### 9.15 `src/python_agent/tools/builtins/apply_patch.py`
@@ -939,21 +1131,30 @@ workspace 中遗留的未完成文件事务；然后在目标目录创建临时�
 3. Update 用 `@@` hunk 和上下文序列定位，按 hunk 顺序向后搜索，避免重复上下文错配。
 4. 全部内容先交给 `FileTransaction`：暂存、hash/mtime 前置条件、持久化 manifest，
    然后再提交；提交失败会逆序回滚，进程崩溃后下一次文件工具操作会恢复未完成事务。
+5. Delete 操作先经过共享 `DeletePolicyEngine`；一次覆盖多个已有文件的 patch 还可能被
+   `ModificationRiskPolicy` 要求额外审批。
 
 它是 exclusive 工具，避免“格式错误或第二个文件失败导致半个 patch”成为模型可见事实。
 
 ### 9.16 `src/python_agent/tools/builtins/bash.py`
 
-Bash 同时受 workspace-write、ApprovalPolicy 和 `SandboxRunner` 约束。执行细节：
+Bash 同时受 workspace-write、`CommandRiskPolicy`、`DeletePolicy`、ApprovalPolicy 和
+`SandboxRunner` 约束。执行细节：
 
 - 命令传给新的 `bash -lc`，每次调用不继承上次 cwd/函数，并在 bubblewrap namespace 中运行。
-- workspace 只挂载到隔离的 `/workspace`；系统目录只读，`/tmp` 是独立 tmpfs。
-- 先用 `bwrap --ro-bind / / --unshare-net -- /bin/true` 探测网络 namespace。可用时使用
-  `bubblewrap-network` 模式并隔离外网；不可用时使用 `bubblewrap-filesystem-restricted`
-  模式和本地命令白名单。
+- workspace 以隔离的 `/workspace` 挂载；系统目录只读，`/tmp` 是独立 tmpfs，受信任的
+  Conda/NVM/runtime 目录只读挂载到其原路径并加入最小 PATH。
+- Agent 显式 `network_mode=disabled` 时要求 network namespace 成功；不可用会返回
+  `environment_blocked`。显式 `network_mode=full` 时不加 `--unshare-net`，但必须有批准的
+  Scope；结果会记录 `network_mode`。
+- 低层旧 API 未提供网络 Profile 时才保留 `bubblewrap-filesystem-restricted` 和本地命令
+  白名单回退；Agent/CLI 不使用这条兼容路径。
+- `CommandRiskAnalyzer` 会拒绝网络命令、宿主机管理命令、保留目录访问和高风险删除，除非
+  当前独立的 Profile/策略明确允许；审批本身不改变沙箱边界。
 - 找不到 bubblewrap 时 fail closed，不会回退到宿主机 Shell。
 - 创建独立进程组，stdout/stderr 写临时文件，异步 `poll()` 等待。
-- 子进程只保留最小非敏感环境变量，不继承 API Key 或其他宿主环境秘密。
+- 子进程只保留最小非敏感环境变量，不继承 API Key 或其他宿主环境秘密；网络模式为 full
+  时只改变网络开关，不改变 workspace 和系统目录挂载。
 - 超时或取消时先 SIGTERM 整个进程组，宽限后升级 SIGKILL。
 - `handles_own_timeout=True`，超时结果包含实际秒数，便于模型修正。
 
@@ -1043,7 +1244,7 @@ for step in range(max_steps):
     累加 usage
     ├─ 没有 tool_calls：检查新 steer，正常 step/end + turn/end
     └─ 有 tool_calls：按模型顺序写 tool/call
-                    → Runtime.execute_many
+                    → Runtime.execute_many（按 Capability、网络 Scope、删除策略和沙箱执行）
                     → 按原顺序写 tool/result
                     → 预算/取消/ concludes_turn 判断
                     → step/end，进入下一 Step
@@ -1054,7 +1255,8 @@ for step in range(max_steps):
 
 模型产生工具调用时，即使预算已经不允许执行，Loop 仍会为每个 call 写一个明确的错误
 `tool/result`，而不是让 call 永久悬挂。`write_file` / `apply_patch` 还会额外写
-`tool/write_intent`。
+`tool/write_intent`；Loop 会把当前任务的 `TaskFileManifest`、`DeletePolicyEngine`、权限
+等级和网络模式放进 `ToolContext`，但这些内部控制信息不会直接发送给模型。
 
 `RunResult` 返回最后 assistant 文本、Session 和 finish reason；注意普通自然结束时
 事件里的 step reason 可能是 `completed`，返回的 `finish_reason` 是模型的 `stop`。
@@ -1195,12 +1397,16 @@ CLI 是接入层，不复制 Agent 逻辑。
 
 #### Agent 创建
 
-`_create_agent()` 统一注册七个内置工具；`--skills-root` 才额外注册 Skill 工具。
-Provider 为 fake 时用 `FakeAdapter`，DeepSeek 时构造 `DeepSeekAdapter`。CLI 把关键能力
-拼进 `preset_id`，并由 `AgentManager` 将完整工具 schema、ToolCapabilities、system prompt、
-权限和策略写入 `capability_fingerprint`。这使 `--resume` 时不匹配配置会明确失败。
+`_create_agent()` 启动时会创建不存在的 workspace，默认注册九个基础内置工具；
+`--enable-container` 才注册固定的
+`container_exec`，`--skills-root` 才额外注册 Skill 工具。Provider 为 fake 时用
+`FakeAdapter`，DeepSeek 时构造 `DeepSeekAdapter`。CLI 把关键能力拼进 `preset_id`，并由
+`AgentManager` 将完整工具 schema、ToolCapabilities、system prompt、权限等级、网络模式
+和策略写入 `capability_fingerprint`。这使 `--resume` 时不匹配配置会明确失败。
 
 Store 默认是 workspace 下的 `.python-agent`；`AgentManager` 额外排除整个 Store 根目录。
+全屏和纯文本 `chat` 在没有 `--approve-bash` 时使用交互式审批队列；`run` 没有 stdin 审批
+循环，未提供审批服务时保持拒绝。`--approve-bash` 是明确的非交互自动批准开关。
 
 #### 子命令
 
@@ -1546,6 +1752,10 @@ python -m pytest -vv tests/test_p0_regressions.py
 - 多文件事务失败后，第一个文件也会回滚。
 - `Path` 等工具结果会在 Session append 前转换为 JSON-safe 值。
 - 未声明能力的自定义工具在 read-only 模式下被拒绝。
+- L0/L1/L2/L3/L4 只授予对应的 Capability；L0/L1 即使误配网络也不能获得网络能力。
+- `network=disabled` 在无法创建隔离 namespace 时 fail closed；`full` 必须有明确 Scope 批准。
+- 任务 manifest 只把本任务新建的临时文件纳入自动清理；普通、批量、敏感和基础设施路径
+  不会被误判为可直接删除。
 - child fork 会重置 lineage；同步 child 结果只进入父上下文一次。
 
 ---
@@ -1562,13 +1772,22 @@ CLI 会把读写工具都注册给模型，但 `PermissionPolicy` 会根据每�
 
 ```text
 permission_mode == workspace-write
+  + 权限等级至少为 L1
   + 对 Bash 还必须有 ApprovalService 明确批准
 ```
 
-### 14.2 `--approve-bash` 只解决审批
+L2/L3/L4 是在基础文件权限之上逐级增加网络、容器和宿主机能力的 Profile，并不会自动
+改变 `permission_mode` 的显式限制。删除也不是普通写入的别名：`DeletePolicyEngine` 会
+根据任务 manifest、目标是否已存在、是否批量以及是否触及敏感/基础设施路径分别决定自动
+删除、软删除、审批或拒绝。
 
-它不修复模型输出截断，不扩大 workspace，也不替代参数校验。Bash 的实际访问范围仍
-由 OS 沙箱和受限命令策略决定；审批不会绕过沙箱。
+### 14.2 `--approve-bash` 和 `--approve-network` 只解决审批
+
+`--approve-bash` 只是给当前进程安装明确的审批回调；它也会被复用来批准部分高风险删除、
+批量 patch 和容器调用。`--approve-network` 只批准当前短生命周期的 network Scope。二者
+都不修复模型输出截断，不扩大 workspace，不替代参数校验，也不会绕过 OS 沙箱、容器边界
+或宿主机管理员执行器。交互式 `chat` 不传 `--approve-bash` 时会显示审批摘要，并由输入
+循环消费 `y/yes` 或 `n/no`；这正是需要人工审批的验证方式。
 
 ### 14.3 能力和并发安全必须由工具声明
 
@@ -1614,10 +1833,11 @@ echo $?
 ```
 
 只运行 `bwrap --unshare-net -- /bin/true` 可能因为命名空间中没有 `/bin/true` 而失败，
-不能据此判断网络 namespace 不可用。探测成功时工具结果中的 `sandbox` 为
-`bubblewrap-network`；探测失败时为 `bubblewrap-filesystem-restricted`，并启用本地命令
-白名单。后者不允许 `git`、`python`、`curl` 等开放能力命令，避免在网络未隔离时静默
-放行宿主机操作。
+不能据此判断网络 namespace 不可用。当前 Agent/CLI 显式使用 `network=disabled` 时，
+探测失败会直接返回 `environment_blocked`；它不会降级为“看似断网”的本地命令白名单。
+使用 `network=full` 时不会添加 `--unshare-net`，但必须先有 `--approve-network`，并仍然
+只挂载 workspace 和最小只读系统文件。`bubblewrap-filesystem-restricted` 及本地命令
+白名单仅保留给未提供 network Profile 的旧低层 API 兼容调用。
 
 ---
 
@@ -1638,9 +1858,17 @@ python-agent "无子命令时也会进入 chat"
 ```bash
 python-agent run "修改文件" --permission-mode workspace-write
 python-agent run "执行命令" --permission-mode workspace-write --approve-bash
+python-agent chat "L2 网络测试" --provider deepseek --permission-mode workspace-write \
+  --permission-level L2 --network-mode full --approve-network --approve-bash
+python-agent chat "L3 容器测试" --provider deepseek --permission-mode workspace-write \
+  --permission-level L3 --network-mode full --approve-network --enable-container --approve-bash
+python-agent chat "L4 Bash 网络测试" --provider deepseek --permission-mode workspace-write \
+  --permission-level L4 --network-mode full --approve-network --approve-bash
 python-agent chat --max-parallel-tools 4 --max-turn-seconds 300
-python-agent chat --max-turn-tokens 20000 --model-max-retries 2
+python-agent chat --max-turn-tokens 20000 --model-max-retries 2  # 模型仍从 .env 读取
 ```
+
+L0、L1、L2、L3、L4 的完整可复制命令见 [1.3 SANBOX 各权限等级的启动命令](#13-sanbox-各权限等级的启动命令)。
 
 ### 15.3 Session 管理
 
@@ -1697,14 +1925,15 @@ python-agent search-sessions "关键词" --limit 20
 | `test_deepseek_adapter.py` | env、SSE DONE、length、HTTP 错误和工具片段 |
 | `test_cli_chat.py`、`test_terminal_ui.py` | 命令分发、队列提示、任务暂停/继续、TUI 回放和滚动 |
 | `test_security_regressions.py` | 敏感凭据、动态 Store 排除、Schema 范围、权限 |
+| `test_sandbox_policy.py` | L0～L4 Capability、网络 Profile、删除策略、Shell 风险和 Docker 参数 |
 
 在当前工作树中使用 `agent` 环境实测：
 
 ```text
-pytest -q                 → 109 passed
-ruff format --check src tests → 79 files already formatted
+pytest -q                 → 127 passed
+ruff format --check src tests → 88 files already formatted
 ruff check .              → All checks passed
-mypy                      → Success: no issues found in 63 source files
+mypy                      → Success: no issues found in 71 source files
 ```
 
 这四项是最值得在修改后重复的回归入口。若只改 Session 或工具策略，至少运行对应的
@@ -1722,7 +1951,17 @@ mypy                      → Success: no issues found in 63 source files
 - 阶段 7 选的是 summary surface replacement、fork、声明式 Skills、SQLite 搜索；远程
   Subagent Provider、Code Mode、LSP、PTY 和 Web/RPC UI 仍没有实现。OS 沙箱已经由
   `tools/sandbox.py` 提供 Linux/WSL bubblewrap 实现；macOS Seatbelt、Windows 受限进程等
-  平台实现仍是后续工作。
+  平台实现仍是后续工作。SANBOX 的 L0～L3、网络 Profile、删除策略、任务 manifest、Shell
+  风险分析、受信任 runtime 只读挂载和固定 Docker 容器后端已实现。
+- L4 的 `host.admin` 只存在于 Capability 模型和策略门控中；当前普通 CLI/Agent 没有受信任
+  的宿主机管理员 executor，所以 `sudo`、`mount`、`systemctl` 和宿主 `/etc` 修改会明确
+  拒绝。`allowlist` 网络和 `setup-approved` 网络也仍需要未接入的 broker/setup runner。
+- L3 默认要求本地存在受信任的 `agent-runtime:latest` 镜像；容器参数由
+  `ContainerManager` 固定生成，不等同于把 Docker 权限交给模型。L3 的网络是否开启仍由
+  `--network-mode full --approve-network` 单独决定，镜像缺少 `curl` 时应使用镜像已有
+  Python 或在同一次临时容器命令中安装它。
+- workspace 初次不存在时 CLI 会先创建；任务 manifest 不会登记 workspace 根。`chat` 不带
+  `--approve-bash` 时使用交互审批队列，`--approve-bash` 则明确表示非交互自动批准。
 - 子 Agent 是进程内生命周期；Session 会落盘，但进程重启不会自动恢复活跃父子管理图。
 - `ContextCompactor` 接受外部摘要；当前 CLI 走人工 `--summary` / `--summary-file`，
   没有自动摘要 Provider。

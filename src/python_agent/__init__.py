@@ -4,11 +4,13 @@
 AgentManager、FakeAdapter 或 Session，而不必了解包内部的目录组织。
 """
 
+from python_agent.approval.service import InteractiveApprovalService
 from python_agent.config import AgentPreset
 from python_agent.core.agent import Agent
 from python_agent.core.agent_loop import AgentLoop, ModelRequestStatus, RunResult
 from python_agent.core.agent_manager import AgentManager
 from python_agent.core.lifecycle import CancelCause, TaskStatus
+from python_agent.errors import EnvironmentBlocked, SandboxError
 from python_agent.hooks.event_bus import LiveEventBus
 from python_agent.llm.fake_adapter import FakeAdapter
 from python_agent.llm.retry import DefaultModelRetryPolicy, ModelRetryPolicy, RetryDecision
@@ -20,6 +22,18 @@ from python_agent.session.store import SessionStore
 from python_agent.skills.registry import SkillRegistry
 from python_agent.subagents.manager import SubagentManager
 from python_agent.subagents.types import SubagentInfo, SubagentSettled, SubagentSpec
+from python_agent.tools.capabilities import (
+    Capability,
+    NetworkMode,
+    PermissionLevel,
+    PermissionProfile,
+)
+from python_agent.tools.command_risk import CommandRiskAnalyzer
+from python_agent.tools.container import ContainerManager
+from python_agent.tools.delete_policy import DeletePolicyEngine, GitStatusProvider
+from python_agent.tools.runtime_env import RuntimeEnvironment
+from python_agent.tools.sandbox import SandboxSpec
+from python_agent.tools.task_manifest import TaskFileManifest
 
 __all__ = [
     "Agent",
@@ -27,22 +41,36 @@ __all__ = [
     "AgentManager",
     "AgentPreset",
     "CancelCause",
+    "Capability",
+    "ContainerManager",
+    "CommandRiskAnalyzer",
     "TaskStatus",
     "ContextCompactor",
     "DefaultModelRetryPolicy",
+    "DeletePolicyEngine",
+    "EnvironmentBlocked",
+    "SandboxError",
+    "GitStatusProvider",
     "FakeAdapter",
     "JsonlSessionStore",
+    "InteractiveApprovalService",
     "LiveEventBus",
     "ModelRequestStatus",
     "ModelRetryPolicy",
+    "NetworkMode",
+    "PermissionLevel",
+    "PermissionProfile",
     "RetryDecision",
+    "RuntimeEnvironment",
     "RunResult",
     "Session",
     "SessionSearchHit",
     "SessionStore",
+    "SandboxSpec",
     "SkillRegistry",
     "SqliteSessionIndex",
     "StaticSummaryProvider",
+    "TaskFileManifest",
     "SubagentInfo",
     "SubagentManager",
     "SubagentSettled",

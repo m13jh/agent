@@ -3,6 +3,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .python-agent/
+.agent-trash/
 *.py[cod]
 *.egg-info/
 dist/

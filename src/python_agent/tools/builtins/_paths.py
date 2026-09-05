@@ -20,12 +20,16 @@ _SENSITIVE_EXACT_NAMES = {
 _SENSITIVE_DIRECTORIES = {".ssh", ".aws", ".gnupg", ".azure", "gcloud"}
 _SENSITIVE_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}
 _SAFE_ENV_EXAMPLES = {".env.example", ".env.sample", ".env.template"}
+_RESERVED_DIRECTORIES = {".python-agent", ".agent-trash"}
 
 
 def workspace_root(context: ToolContext) -> Path:
     """解析本次工具调用的 workspace 根目录；未指定时使用进程当前目录。"""
 
-    return (context.workspace or Path.cwd()).resolve()
+    root = (context.workspace or Path.cwd()).resolve()
+    if root == Path("/"):
+        raise ToolError("workspace root cannot be the filesystem root")
+    return root
 
 
 def safe_path(value: str, context: ToolContext) -> Path:
@@ -45,6 +49,12 @@ def safe_path(value: str, context: ToolContext) -> Path:
     except ValueError as exc:
         raise ToolError(f"path is outside workspace: {value}") from exc
     if is_excluded_path(resolved, context):
+        raise ToolError(f"path is reserved for agent infrastructure: {value}")
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError:
+        relative = resolved
+    if relative.parts and relative.parts[0] in _RESERVED_DIRECTORIES:
         raise ToolError(f"path is reserved for agent infrastructure: {value}")
     if is_sensitive_path(resolved, context):
         raise ToolError(f"access to sensitive credential path is denied: {value}")

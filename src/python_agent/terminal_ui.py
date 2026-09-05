@@ -194,6 +194,10 @@ class FullScreenTerminalUI:
         "bash": "Bash",
         "write_file": "Write",
         "apply_patch": "ApplyPatch",
+        "delete_file": "Delete",
+        "delete_directory": "DeleteDirectory",
+        "container_exec": "ContainerExec",
+        "docker_exec": "DockerExec",
         "echo": "Echo",
         "spawn_agent": "SpawnAgent",
         "subagent_followup": "SubagentFollowup",
@@ -754,6 +758,7 @@ class FullScreenTerminalUI:
         ]
         for command, description in rows:
             self._append(f"    {command:<18} {description}")
+        self._append("    审批请求        输入 y/yes 批准，n/no 拒绝；/exit 拒绝并退出")
         self._append("    PageUp/PageDown 或滚轮浏览 · Ctrl+Home 顶部 · Ctrl+End 底部")
         self._append("    点击工具标题单独展开/折叠 · Ctrl+O 切换全部 · Alt+Enter 换行")
 

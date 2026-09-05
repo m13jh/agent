@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from python_agent.errors import ToolError
 from python_agent.tools.builtins._file_transaction import FileTransaction
 from python_agent.tools.builtins._paths import safe_path, should_hide_path
 from python_agent.tools.definition import ToolCapabilities
@@ -47,6 +48,7 @@ class ListFilesTool:
         ".mypy_cache",
         ".ruff_cache",
         ".python-agent",
+        ".agent-trash",
     }
 
     def is_concurrency_safe(self, arguments: dict[str, Any]) -> bool:
@@ -64,6 +66,11 @@ class ListFilesTool:
         if not root.is_dir():
             return paths
         for path in sorted(root.rglob("*")):
+            try:
+                safe_path(str(path), context)
+            except (ToolError, ValueError):
+                # 不把指向 workspace 外或敏感位置的符号链接当成可见文件。
+                continue
             relative_parts = path.relative_to(root).parts
             if any(part in self._ignored for part in relative_parts) or should_hide_path(
                 path, context

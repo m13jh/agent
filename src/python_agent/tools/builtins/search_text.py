@@ -11,6 +11,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from python_agent.errors import ToolError
 from python_agent.tools.builtins._file_transaction import FileTransaction
 from python_agent.tools.builtins._paths import safe_path, should_hide_path, workspace_root
 from python_agent.tools.definition import ToolCapabilities
@@ -82,6 +83,7 @@ class SearchTextTool:
             "--line-number",
             "--with-filename",
             "--no-heading",
+            "--no-follow",
             "--color",
             "never",
             "--max-count",
@@ -102,6 +104,8 @@ class SearchTextTool:
             "!**/.ssh/**",
             "--glob",
             "!**/.aws/**",
+            "--glob",
+            "!**/.agent-trash/**",
         ]
         for excluded in context.excluded_paths:
             try:
@@ -192,6 +196,7 @@ class SearchTextTool:
                 ".mypy_cache",
                 ".ruff_cache",
                 ".python-agent",
+                ".agent-trash",
                 "dist",
                 "build",
             }
@@ -201,6 +206,10 @@ class SearchTextTool:
                 or any(part in ignored for part in relative_parts)
                 or should_hide_path(path, context)
             ):
+                continue
+            try:
+                safe_path(str(path), context)
+            except (ToolError, ValueError):
                 continue
             try:
                 lines = path.read_text(encoding="utf-8").splitlines()

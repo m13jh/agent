@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import os
 import tempfile
+from pathlib import Path
 from typing import Any
 
 from python_agent.errors import ToolError
 from python_agent.tools.builtins._file_transaction import FileTransaction
 from python_agent.tools.builtins._paths import safe_path, workspace_root
 from python_agent.tools.definition import ToolCapabilities
+from python_agent.tools.task_manifest import TaskFileManifest
 from python_agent.tools.types import ToolContext
 
 
@@ -52,9 +54,15 @@ class WriteFileTool:
             raise ToolError("write_file requires workspace-write mode")
         FileTransaction.recover_pending(workspace_root(context))
         path = safe_path(arguments["path"], context)
-        if path.exists() and path.is_dir():
+        existed_before = path.exists()
+        if existed_before and path.is_dir():
             raise ToolError(f"cannot write directory: {arguments['path']}")
         content = arguments["content"]
+        missing_directories: list[Path] = []
+        cursor = path.parent
+        while not cursor.exists():
+            missing_directories.append(cursor)
+            cursor = cursor.parent
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary_name: str | None = None
         try:
@@ -78,6 +86,12 @@ class WriteFileTool:
                 except OSError:
                     pass
             raise ToolError(f"cannot write {arguments['path']}: {exc}") from exc
+        manifest = context.task_manifest
+        if isinstance(manifest, TaskFileManifest):
+            if not existed_before:
+                manifest.record_created(path)
+            for directory in reversed(missing_directories):
+                manifest.record_generated_dir(directory)
         return {
             "path": path.relative_to(workspace_root(context)).as_posix(),
             "bytes_written": len(content.encode("utf-8")),

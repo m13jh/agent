@@ -102,6 +102,8 @@ class AgentManager:
                     "concurrency_safe": capabilities.concurrency_safe,
                     "requires_approval": capabilities.requires_approval,
                     "interrupt_behavior": capabilities.interrupt_behavior,
+                    "required_capabilities": sorted(capabilities.declared_capabilities()),
+                    "requires_network": capabilities.requires_network,
                 }
         payload = {
             "config": config.model_dump(mode="json"),

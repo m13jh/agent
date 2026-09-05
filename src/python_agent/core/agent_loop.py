@@ -33,9 +33,11 @@ from python_agent.llm.types import (
 )
 from python_agent.prompt.assembler import PromptAssembler
 from python_agent.session.session import Session
+from python_agent.tools.delete_policy import DeletePolicyEngine
 from python_agent.tools.policies import ExecuteHandler, PostHandler, PreHandler
 from python_agent.tools.registry import ToolRegistry
 from python_agent.tools.runtime import ToolRuntime
+from python_agent.tools.task_manifest import TaskFileManifest
 from python_agent.tools.types import ToolContext, ToolResult
 
 EventHandler = Callable[[str, dict[str, Any]], None | Awaitable[None]]
@@ -120,6 +122,33 @@ class AgentLoop:
             agent_preset=self.config.id,
             cwd=workspace or self.config.workspace,
         )
+        manifest_workspace = (
+            self.session.header.cwd or workspace or self.config.workspace or Path.cwd()
+        )
+        task_manifest = TaskFileManifest(
+            str(self.session.id),
+            manifest_workspace,
+            persist=True,
+        )
+        if task_manifest.manifest_path.is_file():
+            try:
+                restored_manifest = TaskFileManifest.load(task_manifest.manifest_path)
+            except Exception:
+                # Manifest 损坏时只丢弃“自动删除”能力，不能因此把未知文件误判为临时产物。
+                pass
+            else:
+                if (
+                    restored_manifest.task_id == str(self.session.id)
+                    and restored_manifest.workspace == manifest_workspace.expanduser().resolve()
+                ):
+                    restored_manifest.persist = True
+                    task_manifest = restored_manifest
+        self.task_manifest = task_manifest
+        self.delete_policy = DeletePolicyEngine(
+            workspace=manifest_workspace,
+            manifest=self.task_manifest,
+            approval_service=approval_service,
+        )
         self.prompt_assembler = PromptAssembler.default()
         self.system_prompt = system_prompt or self.prompt_assembler.assemble()
         self.excluded_paths = tuple(path.expanduser().resolve() for path in excluded_paths)
@@ -142,6 +171,7 @@ class AgentLoop:
             pre_policies=pre_policies,
             execute_policies=execute_policies,
             post_policies=post_policies,
+            delete_policy_engine=self.delete_policy,
         )
         self.request_retry_policy = request_retry_policy or DefaultModelRetryPolicy(
             self.config.model_retry_base_delay_seconds
@@ -728,7 +758,14 @@ class AgentLoop:
                         workspace=self.session.header.cwd,
                         cancel_event=self.cancel_event,
                         permission_mode=self.config.permission_mode,
+                        permission_level=self.config.permission_level,
+                        network_mode=self.config.network_mode,
                         excluded_paths=self.excluded_paths,
+                        task_manifest=self.task_manifest,
+                        delete_policy=self.delete_policy,
+                        metadata={
+                            "network_scope_approved": self.config.network_scope_approved,
+                        },
                     )
                     tool_violation = usage_violation
                     if tool_violation is not None:

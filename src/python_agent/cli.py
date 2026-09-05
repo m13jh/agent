@@ -22,7 +22,12 @@ from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from python_agent.approval.service import ApprovalRequest, CallbackApprovalService
+from python_agent.approval.service import (
+    ApprovalRequest,
+    ApprovalService,
+    CallbackApprovalService,
+    InteractiveApprovalService,
+)
 from python_agent.config import AgentPreset
 from python_agent.core.agent import Agent
 from python_agent.core.agent_manager import AgentManager
@@ -42,12 +47,15 @@ from python_agent.terminal_ui import FullScreenTerminalUI, TerminalUI
 from python_agent.tools.builtins import (
     ApplyPatchTool,
     BashTool,
+    DeleteDirectoryTool,
+    DeleteFileTool,
     EchoTool,
     ListFilesTool,
     ReadFileTool,
     SearchTextTool,
     WriteFileTool,
 )
+from python_agent.tools.container import ContainerExecTool
 from python_agent.tools.registry import ToolRegistry
 
 LiveHandler = Callable[[str, dict[str, Any]], None | Awaitable[None]]
@@ -168,10 +176,12 @@ def _display_event(event_type: str, data: dict[str, Any]) -> None:
         )
 
 
-def _allow_explicit_bash(_request: ApprovalRequest) -> bool:
-    """实现 --approve-bash 的明确授权；没有该开关时审批服务保持默认拒绝。"""
+def _allow_explicit_bash(request: ApprovalRequest) -> bool:
+    """实现 --approve-bash 的非交互授权，但不替代独立网络 Scope 批准。"""
 
-    return True
+    # 网络是和 Bash 分离的权限维度；即使调用方选择自动批准 Bash，也必须显式传入
+    # --approve-network，避免一个旧的“允许执行命令”开关悄悄打开外网。
+    return not request.reason.startswith("network Scope required")
 
 
 def _demo_responder(path: str) -> ResponseFactory:
@@ -270,9 +280,31 @@ def _add_agent_options(command: argparse.ArgumentParser) -> None:
         help="whether write_file, apply_patch and bash may run",
     )
     command.add_argument(
+        "--permission-level",
+        choices=("L0", "L1", "L2", "L3", "L4"),
+        default=None,
+        help="explicit SANBOX permission level; defaults to L0/L1 from permission mode",
+    )
+    command.add_argument(
+        "--network-mode",
+        choices=("disabled", "setup-approved", "allowlist", "full"),
+        default="disabled",
+        help="independent network scope for sandboxed commands",
+    )
+    command.add_argument(
+        "--approve-network",
+        action="store_true",
+        help="approve the current short-lived network scope when a network mode requests it",
+    )
+    command.add_argument(
+        "--enable-container",
+        action="store_true",
+        help="expose the fixed L3 container_exec tool",
+    )
+    command.add_argument(
         "--approve-bash",
         action="store_true",
-        help="explicitly approve all bash calls for this process",
+        help="non-interactively approve bash and other high-risk calls for this process",
     )
 
 
@@ -349,6 +381,7 @@ async def _create_agent(
     args: argparse.Namespace,
     *,
     event_handler: LiveHandler | None = None,
+    approval_service: ApprovalService | None = None,
 ) -> tuple[AgentManager, Agent]:
     """根据命令行参数创建 Manager、共享事件总线、工具集合和 Agent Handle。"""
 
@@ -362,9 +395,15 @@ async def _create_agent(
             WriteFileTool(),
             ApplyPatchTool(),
             BashTool(),
+            DeleteFileTool(),
+            DeleteDirectoryTool(),
         ]
     )
-    workspace = args.workspace.resolve()
+    workspace = args.workspace.expanduser().resolve()
+    # workspace 是调用方明确选择的项目边界；如果路径尚不存在，初始化它可以让根目录
+    # 文件写入和 Docker bind mount 使用同一语义，而不会在工具成功后再因挂载/manifest
+    # 失败产生“实际已创建但返回错误”的假失败。
+    workspace.mkdir(parents=True, exist_ok=True)
     skills_root: Path | None = None
     if args.skills_root is not None:
         skills_root = (
@@ -375,6 +414,8 @@ async def _create_agent(
         skill_registry = SkillRegistry(skills_root)
         registry.register(ListSkillsTool(skill_registry))
         registry.register(LoadSkillTool(skill_registry, registry))
+    if args.enable_container:
+        registry.register(ContainerExecTool())
     if args.provider == "deepseek":
         # DeepSeekAdapter 在初始化时读取 .env；model 再从命令行、环境变量或默认值解析。
         adapter: ModelAdapter = DeepSeekAdapter()
@@ -386,7 +427,10 @@ async def _create_agent(
         model = args.model or "fake-model"
     # CLI 没有独立的 preset 配置文件，因此把影响恢复能力的关键选项编码进稳定 ID。
     # 用户若用不同 Provider、模型、权限或步数恢复，Manager 会因 ID 不匹配而明确拒绝。
-    preset_id = f"cli-v1:{args.provider}:{model}:{args.permission_mode}:steps={args.max_steps}"
+    preset_id = (
+        f"cli-v1:{args.provider}:{model}:{args.permission_mode}:steps={args.max_steps}"
+        f":level={args.permission_level or '-'}:network={args.network_mode}"
+    )
     phase5_values = (
         args.max_parallel_tools,
         args.max_turn_tokens,
@@ -406,6 +450,10 @@ async def _create_agent(
         preset_id += f":p6=depth{args.max_subagent_depth},children{args.max_subagents}"
     if skills_root is not None:
         preset_id += f":skills={skills_root}"
+    if args.approve_network:
+        preset_id += ":network-approved"
+    if args.enable_container:
+        preset_id += ":container"
     config = AgentPreset(
         id=preset_id,
         provider=args.provider,
@@ -425,8 +473,12 @@ async def _create_agent(
         skills_root=skills_root,
         workspace=workspace,
         permission_mode=args.permission_mode,
+        permission_level=args.permission_level,
+        network_mode=args.network_mode,
+        network_scope_approved=args.approve_network,
     )
-    approval_service = CallbackApprovalService(_allow_explicit_bash) if args.approve_bash else None
+    if approval_service is None and args.approve_bash:
+        approval_service = CallbackApprovalService(_allow_explicit_bash)
     event_bus = LiveEventBus()
     event_bus.subscribe("*", event_handler or _display_event)
     store = JsonlSessionStore(_session_root(args.session_root, workspace))
@@ -596,6 +648,51 @@ def _chat_output(
         ui.print_notice(message, style=style)
 
 
+def _short_approval_value(value: Any, *, maximum: int = 240) -> str:
+    """把审批摘要压成单行，避免把大段工具参数或文件内容直接刷到终端。"""
+
+    text = " ".join(str(value).split())
+    return text if len(text) <= maximum else text[: maximum - 1] + "…"
+
+
+def _format_approval_request(request: ApprovalRequest) -> str:
+    """生成不包含 write_file 全文的可读审批提示。"""
+
+    arguments = request.arguments
+    details: str
+    if request.tool_name in {"bash", "container_exec", "docker_exec"}:
+        details = f"命令：{_short_approval_value(arguments.get('command', ''))}"
+    elif request.tool_name == "write_file":
+        content = arguments.get("content", "")
+        size = len(content.encode("utf-8")) if isinstance(content, str) else "?"
+        details = f"路径：{arguments.get('path', '')}；写入字节：{size}（内容不在审批提示中显示）"
+    elif request.tool_name == "apply_patch":
+        patch = str(arguments.get("patch", ""))
+        paths = re.findall(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", patch, re.MULTILINE)
+        details = f"目标：{', '.join(paths) or 'workspace patch'}"
+    elif request.tool_name in {"delete_file", "delete_directory"}:
+        details = f"目标：{arguments.get('path', '')}"
+    else:
+        details = f"参数键：{', '.join(sorted(str(key) for key in arguments)) or '无'}"
+    return (
+        f"[需要审批] {request.tool_name}\n"
+        f"原因：{request.reason}\n"
+        f"{details}\n"
+        "输入 y/yes 批准，n/no 拒绝；输入 /exit 可退出并拒绝未完成审批。"
+    )
+
+
+def _interactive_approval_notice(
+    ui: TerminalUI | None,
+) -> Callable[[ApprovalRequest], None]:
+    """创建只负责显示审批请求的回调；stdin 仍由 chat 主循环独占。"""
+
+    def notify(request: ApprovalRequest) -> None:
+        _chat_output(ui, _format_approval_request(request), style="yellow")
+
+    return notify
+
+
 def _print_chat_help(ui: TerminalUI | None = None) -> None:
     """显示交互式终端支持的特殊命令。"""
 
@@ -617,6 +714,7 @@ def _print_chat_help(ui: TerminalUI | None = None) -> None:
 直接输入其他文本会调用 followup，开启一个新的 Turn。
 “你>”是终端提示符，无需手动输入；误粘贴时会自动移除。
 Agent 运行中的 followup 会显示“已排队”，并在当前任务结束后按顺序处理。
+需要人工确认时输入 y/yes 批准或 n/no 拒绝；--approve-bash 会关闭这类 Bash/高风险工具询问。
 """
     )
 
@@ -661,6 +759,7 @@ async def _dispatch_chat_line(
     agent: Agent,
     raw_line: str,
     ui: TerminalUI | None = None,
+    approval_service: InteractiveApprovalService | None = None,
 ) -> bool:
     """解析并执行一行交互输入；返回 True 表示调用方应退出 REPL。
 
@@ -678,6 +777,34 @@ async def _dispatch_chat_line(
             style="yellow",
         )
     if not line:
+        return False
+    if approval_service is not None and approval_service.has_pending:
+        if line == "/exit":
+            approval_service.close()
+            _chat_output(ui, "[审批] 已拒绝未完成请求，正在退出。", style="yellow")
+            return True
+        normalized = line.casefold()
+        if normalized in {"y", "yes", "是", "同意", "允许", "/approve", "/approve yes"}:
+            approval_request = approval_service.pending_request
+            approval_service.respond(True)
+            _chat_output(
+                ui,
+                f"[审批] {approval_request.tool_name if approval_request is not None else '请求'} "
+                "已批准。",
+                style="green",
+            )
+            return False
+        if normalized in {"n", "no", "否", "拒绝", "不允许", "/deny", "/deny no"}:
+            approval_request = approval_service.pending_request
+            approval_service.respond(False)
+            _chat_output(
+                ui,
+                f"[审批] {approval_request.tool_name if approval_request is not None else '请求'} "
+                "已拒绝。",
+                style="yellow",
+            )
+            return False
+        _chat_output(ui, "[审批] 当前有待处理请求，请输入 y/yes 或 n/no。", style="yellow")
         return False
     if line in {"/exit", "/quit"}:
         return True
@@ -807,21 +934,35 @@ async def _chat(args: argparse.Namespace) -> int:
     use_full_screen = not args.plain and sys.stdin.isatty() and sys.stdout.isatty()
     if use_full_screen:
         ui = FullScreenTerminalUI()
-        manager, agent = await _create_agent(args, event_handler=ui.handle_event)
+        interactive_approval = (
+            None
+            if args.approve_bash
+            else InteractiveApprovalService(_interactive_approval_notice(ui))
+        )
+        manager, agent = await _create_agent(
+            args,
+            event_handler=ui.handle_event,
+            approval_service=interactive_approval,
+        )
 
         async def dispatch(line: str) -> bool:
-            return await _dispatch_chat_line(agent, line, ui)
+            return await _dispatch_chat_line(agent, line, ui, interactive_approval)
 
         try:
             await ui.run(agent, dispatch, initial_prompt=args.prompt)
         finally:
+            if interactive_approval is not None:
+                interactive_approval.close()
             if agent.status == "running":
                 await agent.cancel(CancelCause(kind="user", message="退出交互终端"))
             await manager.shutdown()
             ui.show_goodbye()
         return 0
 
-    manager, agent = await _create_agent(args)
+    interactive_approval = None
+    if not args.approve_bash:
+        interactive_approval = InteractiveApprovalService(_interactive_approval_notice(None))
+    manager, agent = await _create_agent(args, approval_service=interactive_approval)
     prompt_session: PromptSession[str] = PromptSession(
         message="你> ",
         history=InMemoryHistory(),
@@ -834,7 +975,11 @@ async def _chat(args: argparse.Namespace) -> int:
         should_exit = False
         if args.prompt:
             print(f"你> {args.prompt}")
-            should_exit = await _dispatch_chat_line(agent, args.prompt)
+            should_exit = await _dispatch_chat_line(
+                agent,
+                args.prompt,
+                approval_service=interactive_approval,
+            )
         with patch_stdout():
             while not should_exit:
                 try:
@@ -852,9 +997,15 @@ async def _chat(args: argparse.Namespace) -> int:
                     else:
                         print("输入 /exit 或按 Ctrl-D 退出。")
                     continue
-                if await _dispatch_chat_line(agent, raw_line):
+                if await _dispatch_chat_line(
+                    agent,
+                    raw_line,
+                    approval_service=interactive_approval,
+                ):
                     break
     finally:
+        if interactive_approval is not None:
+            interactive_approval.close()
         if agent.status == "running":
             await agent.cancel(CancelCause(kind="user", message="退出交互终端"))
         await manager.shutdown()

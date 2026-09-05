@@ -10,6 +10,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from python_agent.errors import ConfigurationError
+from python_agent.tools.capabilities import NetworkModeName, PermissionLevelName
 
 
 class AgentPreset(BaseModel):
@@ -80,6 +81,21 @@ class AgentPreset(BaseModel):
     permission_mode: Literal["read-only", "workspace-write"] = Field(
         default="read-only",
         description="工具权限模式；写工具和 Bash 需要 workspace-write",
+    )
+    permission_level: PermissionLevelName | None = Field(
+        default=None,
+        description=("可选 SANBOX 权限等级；未指定时 read-only/workspace-write 分别映射为 L0/L1"),
+    )
+    network_mode: NetworkModeName = Field(
+        default="disabled",
+        description=(
+            "独立网络 Profile；disabled 强制断网，setup-approved/allowlist/full 不能隐式"
+            "改变 workspace 权限"
+        ),
+    )
+    network_scope_approved: bool = Field(
+        default=False,
+        description="是否由受信任调用方预先批准当前短生命周期网络 Scope",
     )
     approval_required: tuple[str, ...] = Field(
         default=("bash",),

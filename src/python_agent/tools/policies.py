@@ -6,7 +6,7 @@ import asyncio
 import json
 import re
 import tempfile
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -16,7 +16,17 @@ from python_agent.errors import ToolError, ToolValidationError
 from python_agent.hooks.waterfall import Waterfall
 from python_agent.llm.types import ToolCall
 from python_agent.tools.builtins._paths import safe_path, workspace_root
+from python_agent.tools.capabilities import (
+    FILESYSTEM_WORKSPACE_READ,
+    HOST_ADMIN,
+    NETWORK_INTERNET,
+    PROCESS_READONLY,
+    NetworkMode,
+    coerce_network_mode,
+)
+from python_agent.tools.command_risk import CommandRiskAnalyzer
 from python_agent.tools.definition import ToolCapabilities, ToolDefinition
+from python_agent.tools.delete_policy import DeletePolicyEngine
 from python_agent.tools.serialization import JsonSerializationError, to_json_safe
 from python_agent.tools.types import ToolContext, ToolResult
 
@@ -241,11 +251,380 @@ class PermissionPolicy:
             if isinstance(raw_capabilities, ToolCapabilities)
             else ToolCapabilities()
         )
-        if invocation.context.permission_mode == "read-only" and not capabilities.read_only:
+        required = capabilities.declared_capabilities()
+        if invocation.tool.name == "bash" and (
+            CommandRiskAnalyzer.is_explicit_read_only(
+                str(invocation.call.arguments.get("command", ""))
+            )
+        ):
+            # 只读 Shell 只需要 L0 的 workspace read/process readonly；写 Shell 仍然按
+            # 工具的静态危险能力要求 L1 workspace write 和 process.execute。
+            required = frozenset({FILESYSTEM_WORKSPACE_READ, PROCESS_READONLY})
+        granted = invocation.context.effective_capabilities()
+        missing = sorted(required - granted)
+        if HOST_ADMIN in required and not (
+            invocation.context.metadata.get("host_admin_executor", False)
+            and invocation.context.metadata.get("host_admin_approved", False)
+        ):
             return _error(
                 invocation,
-                f"permission denied: {invocation.tool.name} is not read-only",
+                "permission denied: host.admin is not available to ordinary Agent tools",
             )
+        if missing:
+            return _error(
+                invocation,
+                "permission denied: "
+                f"{invocation.tool.name} requires capabilities {', '.join(sorted(required))}; "
+                f"missing {', '.join(missing)}",
+            )
+        return await next_handler(invocation)
+
+
+class NetworkPolicy:
+    """Pre 策略：为声明 network.internet 的非 Shell 工具管理短期网络 Scope。"""
+
+    @staticmethod
+    async def _approve_scope(invocation: ToolInvocation, reason: str) -> bool:
+        service = invocation.context.approval_service
+        if service is None:
+            return False
+        request = ApprovalRequest(
+            call_id=invocation.call.id,
+            tool_name=invocation.tool.name,
+            arguments=invocation.call.arguments,
+            reason=reason,
+        )
+        try:
+            approved = bool(await service.request(request))
+        except Exception:
+            return False
+        if approved:
+            invocation.context.metadata["network_scope_approved"] = True
+            skipped = invocation.context.metadata.setdefault(
+                "__network_policy_skip_approval__", set()
+            )
+            if isinstance(skipped, set):
+                skipped.add(str(invocation.call.id))
+            approved_tools = invocation.context.metadata.setdefault(
+                "__approved_tool_names__", set()
+            )
+            if isinstance(approved_tools, set):
+                approved_tools.add(invocation.tool.name)
+        return approved
+
+    async def __call__(
+        self, invocation: ToolInvocation, next_handler: Callable[..., Awaitable[Any]]
+    ) -> Any:
+        raw_capabilities = getattr(invocation.tool, "capabilities", None)
+        capabilities = (
+            raw_capabilities
+            if isinstance(raw_capabilities, ToolCapabilities)
+            else ToolCapabilities()
+        )
+        if NETWORK_INTERNET not in capabilities.declared_capabilities():
+            return await next_handler(invocation)
+        mode = coerce_network_mode(invocation.context.network_mode)
+        if mode in {None, NetworkMode.DISABLED}:
+            return _error(
+                invocation,
+                "network blocked: this Agent is running with network=disabled",
+            )
+        if mode == NetworkMode.SETUP_APPROVED and not invocation.context.metadata.get(
+            "setup_runner", False
+        ):
+            return _error(
+                invocation,
+                "network blocked: setup-approved is only available inside a setup runner",
+            )
+        if mode == NetworkMode.ALLOWLIST:
+            return _error(
+                invocation,
+                "network unavailable: allowlist mode requires a broker-backed executor",
+            )
+        if not invocation.context.metadata.get("network_scope_approved", False):
+            if not await self._approve_scope(
+                invocation,
+                f"network Scope required for {mode.value} tool {invocation.tool.name}",
+            ):
+                return _error(
+                    invocation,
+                    f"network blocked: {mode.value} requires an explicit approved scope",
+                )
+        return await next_handler(invocation)
+
+
+class ModificationRiskPolicy:
+    """Pre 策略：对一次补丁大量覆盖已有文件要求额外审批。"""
+
+    _bulk_update_threshold = 5
+
+    @staticmethod
+    async def _request_approval(invocation: ToolInvocation, paths: list[str]) -> bool:
+        service = invocation.context.approval_service
+        if service is None:
+            return False
+        request = ApprovalRequest(
+            call_id=invocation.call.id,
+            tool_name=invocation.tool.name,
+            arguments={"paths": paths, "operation": "bulk-overwrite"},
+            reason=(f"patch overwrites {len(paths)} existing files; explicit approval is required"),
+        )
+        try:
+            return bool(await service.request(request))
+        except Exception:
+            return False
+
+    async def __call__(
+        self, invocation: ToolInvocation, next_handler: Callable[..., Awaitable[Any]]
+    ) -> Any:
+        if invocation.tool.name != "apply_patch":
+            return await next_handler(invocation)
+        paths = [
+            line.removeprefix("*** Update File: ").strip()
+            for line in str(invocation.call.arguments.get("patch", "")).splitlines()
+            if line.startswith("*** Update File: ")
+        ]
+        paths = sorted(set(paths))
+        if len(paths) < self._bulk_update_threshold:
+            return await next_handler(invocation)
+        if not await self._request_approval(invocation, paths):
+            return _error(
+                invocation,
+                "approval denied: bulk overwrite of existing workspace files",
+            )
+        return await next_handler(invocation)
+
+
+class CommandRiskPolicy:
+    """Pre 策略：阻止 Shell 绕过独立的网络和宿主机权限边界。"""
+
+    @staticmethod
+    async def _approve_scope(invocation: ToolInvocation, reason: str) -> bool:
+        """为一次具体网络命令请求短生命周期批准。"""
+
+        service = invocation.context.approval_service
+        if service is None:
+            return False
+        request = ApprovalRequest(
+            call_id=invocation.call.id,
+            tool_name=invocation.tool.name,
+            arguments=invocation.call.arguments,
+            reason=reason,
+        )
+        try:
+            approved = bool(await service.request(request))
+        except Exception:
+            return False
+        if approved:
+            invocation.context.metadata["network_scope_approved"] = True
+            skipped = invocation.context.metadata.setdefault(
+                "__network_policy_skip_approval__", set()
+            )
+            if isinstance(skipped, set):
+                skipped.add(str(invocation.call.id))
+            approved_tools = invocation.context.metadata.setdefault(
+                "__approved_tool_names__", set()
+            )
+            if isinstance(approved_tools, set):
+                approved_tools.add(invocation.tool.name)
+        return approved
+
+    async def __call__(
+        self, invocation: ToolInvocation, next_handler: Callable[..., Awaitable[Any]]
+    ) -> Any:
+        """分析 Bash 命令；网络 Scope 不满足时在进入 Sandbox 前拒绝。"""
+
+        if invocation.tool.name not in {"bash", "container_exec", "docker_exec"}:
+            return await next_handler(invocation)
+        command = str(invocation.call.arguments.get("command", ""))
+        risk = CommandRiskAnalyzer.analyze(command)
+        if risk.reserved_path:
+            return _error(
+                invocation,
+                "permission denied: agent infrastructure paths are not available to Shell",
+            )
+        if risk.host_admin and invocation.tool.name == "bash":
+            return _error(
+                invocation,
+                "host-admin command denied: ordinary Agent tools cannot modify the host; "
+                "use the dedicated L4 workflow",
+            )
+        if (
+            invocation.tool.name == "bash"
+            and risk.read_only
+            and CommandRiskAnalyzer.is_explicit_read_only(command)
+        ):
+            skipped = invocation.context.metadata.setdefault(
+                "__readonly_bash_skip_approval__", set()
+            )
+            if isinstance(skipped, set):
+                skipped.add(str(invocation.call.id))
+        if risk.network_required:
+            mode = coerce_network_mode(invocation.context.network_mode)
+            if mode in {None, NetworkMode.DISABLED}:
+                return _error(
+                    invocation,
+                    "network blocked: this Agent is running with network=disabled",
+                )
+            if mode == NetworkMode.SETUP_APPROVED and not invocation.context.metadata.get(
+                "setup_runner", False
+            ):
+                return _error(
+                    invocation,
+                    "network blocked: setup-approved is only available inside a setup runner",
+                )
+            if mode == NetworkMode.ALLOWLIST:
+                return _error(
+                    invocation,
+                    "network unavailable: allowlist mode requires a broker-backed executor",
+                )
+            if not invocation.context.metadata.get("network_scope_approved", False):
+                approved = await self._approve_scope(
+                    invocation,
+                    f"network Scope required for {mode.value} command",
+                )
+                if not approved:
+                    return _error(
+                        invocation,
+                        f"network blocked: {mode.value} requires an explicit approved scope",
+                    )
+        return await next_handler(invocation)
+
+
+class DeletePolicy:
+    """Pre 策略：让文件、补丁和 Shell 删除共享 DeletePolicyEngine。"""
+
+    def __init__(self, engine: DeletePolicyEngine | None = None) -> None:
+        self.engine = engine
+
+    def _engine_for(self, context: ToolContext) -> DeletePolicyEngine:
+        """优先使用调用方绑定的引擎，否则按本次 workspace 创建受控实例。"""
+
+        if self.engine is not None:
+            return self.engine
+        candidate = context.delete_policy
+        if isinstance(candidate, DeletePolicyEngine):
+            return candidate
+        return DeletePolicyEngine(manifest=context.task_manifest)
+
+    @staticmethod
+    def _decision_store(context: ToolContext) -> dict[str, Any]:
+        store = context.metadata.setdefault("__delete_decisions__", {})
+        return store if isinstance(store, dict) else {}
+
+    @staticmethod
+    def _skip_approval_store(context: ToolContext) -> set[str]:
+        store = context.metadata.setdefault("__delete_policy_skip_approval__", set())
+        if not isinstance(store, set):
+            store = set()
+            context.metadata["__delete_policy_skip_approval__"] = store
+        return store
+
+    async def _authorize(
+        self,
+        invocation: ToolInvocation,
+        paths: str | Path | Iterable[str | Path],
+        *,
+        recursive: bool = False,
+        batch: bool = False,
+        source: str,
+    ) -> ToolResult | None:
+        engine = self._engine_for(invocation.context)
+        decision = await engine.authorize(
+            paths,
+            context=invocation.context,
+            call_id=invocation.call.id,
+            tool_name=invocation.tool.name,
+            arguments=invocation.call.arguments,
+            recursive=recursive,
+            batch=batch,
+            source=source,
+        )
+        if not decision.allowed:
+            return _error(invocation, f"delete denied: {decision.reason}")
+        decisions = self._decision_store(invocation.context)
+        for path in decision.paths:
+            decisions[str(path.expanduser().resolve())] = decision
+        if invocation.tool.name != "container_exec" and invocation.tool.name != "docker_exec":
+            self._skip_approval_store(invocation.context).add(str(invocation.call.id))
+        if invocation.tool.name in {"bash"}:
+            approved_tools = invocation.context.metadata.setdefault(
+                "__approved_tool_names__", set()
+            )
+            if isinstance(approved_tools, set):
+                approved_tools.add(invocation.tool.name)
+        return None
+
+    async def __call__(
+        self, invocation: ToolInvocation, next_handler: Callable[..., Awaitable[Any]]
+    ) -> Any:
+        """只对明确识别的删除操作做决策，普通读写工具直接继续。"""
+
+        name = invocation.tool.name
+        arguments = invocation.call.arguments
+        if name == "delete_file":
+            result = await self._authorize(
+                invocation,
+                str(arguments.get("path", "")),
+                source="delete_file",
+            )
+            return result if result is not None else await next_handler(invocation)
+        if name == "delete_directory":
+            result = await self._authorize(
+                invocation,
+                str(arguments.get("path", "")),
+                recursive=True,
+                batch=True,
+                source="delete_directory",
+            )
+            return result if result is not None else await next_handler(invocation)
+        if name == "apply_patch":
+            patch = str(arguments.get("patch", ""))
+            paths = [
+                line.removeprefix("*** Delete File: ").strip()
+                for line in patch.splitlines()
+                if line.startswith("*** Delete File: ")
+            ]
+            if paths:
+                result = await self._authorize(
+                    invocation,
+                    paths,
+                    batch=len(paths) > 1,
+                    source="apply_patch",
+                )
+                return result if result is not None else await next_handler(invocation)
+        if name in {"bash", "container_exec", "docker_exec"}:
+            risk = CommandRiskAnalyzer.analyze(str(arguments.get("command", "")))
+            if risk.unknown_delete_scope:
+                return _error(
+                    invocation,
+                    "delete denied: Shell deletion target scope is not fully determinable; "
+                    "use delete_file/delete_directory with explicit paths",
+                )
+            if risk.delete_paths:
+                try:
+                    command_cwd = safe_path(str(arguments.get("cwd", ".")), invocation.context)
+                except (ToolError, ValueError) as exc:
+                    return _error(invocation, f"{type(exc).__name__}: {exc}")
+                resolved_paths = [
+                    (
+                        str(workspace_root(invocation.context) / Path(*Path(path).parts[2:]))
+                        if name in {"container_exec", "docker_exec"}
+                        and Path(path).parts[:2] == ("/", "workspace")
+                        else path
+                        if Path(path).is_absolute()
+                        else str(command_cwd / path)
+                    )
+                    for path in risk.delete_paths
+                ]
+                result = await self._authorize(
+                    invocation,
+                    resolved_paths,
+                    recursive=risk.recursive,
+                    batch=risk.batch,
+                    source="bash",
+                )
+                return result if result is not None else await next_handler(invocation)
         return await next_handler(invocation)
 
 
@@ -266,6 +645,16 @@ class ApprovalPolicy:
         self, invocation: ToolInvocation, next_handler: Callable[..., Awaitable[Any]]
     ) -> Any:
         """构造最小审批请求；审批失败或服务异常都按拒绝处理。"""
+
+        skipped = invocation.context.metadata.get("__delete_policy_skip_approval__", set())
+        if isinstance(skipped, set) and str(invocation.call.id) in skipped:
+            return await next_handler(invocation)
+        network_skipped = invocation.context.metadata.get("__network_policy_skip_approval__", set())
+        if isinstance(network_skipped, set) and str(invocation.call.id) in network_skipped:
+            return await next_handler(invocation)
+        readonly_skipped = invocation.context.metadata.get("__readonly_bash_skip_approval__", set())
+        if isinstance(readonly_skipped, set) and str(invocation.call.id) in readonly_skipped:
+            return await next_handler(invocation)
 
         raw_capabilities = getattr(invocation.tool, "capabilities", None)
         capabilities = (
@@ -292,6 +681,9 @@ class ApprovalPolicy:
             return _error(invocation, f"approval denied: {type(exc).__name__}: {exc}")
         if not approved:
             return _error(invocation, f"approval denied for tool {invocation.tool.name}")
+        approved_tools = invocation.context.metadata.setdefault("__approved_tool_names__", set())
+        if isinstance(approved_tools, set):
+            approved_tools.add(invocation.tool.name)
         return await next_handler(invocation)
 
 
@@ -387,6 +779,7 @@ def build_pre_waterfall(
     approval_service: ApprovalService | None,
     approval_required: set[str] | frozenset[str],
     custom: tuple[PreHandler, ...] = (),
+    delete_policy_engine: DeletePolicyEngine | None = None,
 ) -> Waterfall:
     """创建默认 Pre 策略链，并把调用方策略追加到内置安全检查之后。"""
 
@@ -395,6 +788,10 @@ def build_pre_waterfall(
             ArgumentValidationPolicy(),
             WorkspacePathPolicy(),
             PermissionPolicy(),
+            NetworkPolicy(),
+            ModificationRiskPolicy(),
+            CommandRiskPolicy(),
+            DeletePolicy(delete_policy_engine),
             ApprovalPolicy(approval_service, approval_required),
             *custom,
         ]

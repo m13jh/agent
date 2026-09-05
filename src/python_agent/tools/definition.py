@@ -7,6 +7,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
 
+from python_agent.tools.capabilities import (
+    FILESYSTEM_WORKSPACE_READ,
+    FILESYSTEM_WORKSPACE_WRITE,
+    NETWORK_INTERNET,
+    PROCESS_EXECUTE,
+)
 from python_agent.tools.types import ToolContext
 
 ToolBody = Callable[[dict[str, Any], ToolContext], Any | Awaitable[Any]]
@@ -26,6 +32,37 @@ class ToolCapabilities:
     concurrency_safe: bool = False
     requires_approval: bool = True
     interrupt_behavior: Literal["cancel", "block"] = "cancel"
+    required_capabilities: frozenset[str] = frozenset()
+    requires_network: bool = False
+
+    def __post_init__(self) -> None:
+        """把旧布尔声明物化为命名 Capability，确保每个工具都有显式快照。"""
+
+        declared = set(self.required_capabilities)
+        if not declared:
+            declared.add(
+                FILESYSTEM_WORKSPACE_READ if self.read_only else FILESYSTEM_WORKSPACE_WRITE
+            )
+            if self.open_world:
+                declared.add(PROCESS_EXECUTE)
+        if self.requires_network:
+            declared.add(NETWORK_INTERNET)
+        object.__setattr__(self, "required_capabilities", frozenset(declared))
+
+    def declared_capabilities(self) -> frozenset[str]:
+        """返回工具真正声明的命名 Capability 集合。
+
+        旧版工具只填写布尔安全属性，因此这里保留一个确定的兼容映射；新工具可以用
+        ``required_capabilities`` 明确声明更细粒度的能力。未声明的工具仍沿用危险默认值。
+        """
+
+        return self.required_capabilities
+
+    @property
+    def capability_names(self) -> frozenset[str]:
+        """``required_capabilities`` 的可读别名。"""
+
+        return self.required_capabilities
 
 
 @runtime_checkable

@@ -9,6 +9,7 @@ from python_agent.approval.service import (
     ApprovalService,
     CallbackApprovalService,
     DenyApprovalService,
+    InteractiveApprovalService,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "ApprovalService",
     "CallbackApprovalService",
     "DenyApprovalService",
+    "InteractiveApprovalService",
 ]
